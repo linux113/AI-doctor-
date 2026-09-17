@@ -24,6 +24,8 @@ declared, separately-labelled fallback decided by the caller.
 import time
 from typing import Any, Dict, List, Optional
 
+from pydantic import ValidationError
+
 from runner.diagnostics import record_log
 from runner.redaction import sanitize_deep
 
@@ -39,27 +41,247 @@ from .prompts import SYSTEM_PROMPT, build_user_prompt
 from .schemas import AgentTelemetry, DiagnosisResult, PolicyDecision
 from .tools import ALLOWED_TOOL_NAMES, ToolBudget, build_diagnostic_tools, summarise_tool_use
 
-# Outcome states for an agent-assisted diagnosis.
+# ---------------------------------------------------------------------------
+# Two different questions, kept in two different fields
+# ---------------------------------------------------------------------------
+# Conflating them is how a system ends up claiming an AI diagnosis that never
+# happened. `bedrock_status` answers "did a real model round trip succeed?";
+# `diagnosis_outcome` answers "what should happen next?".
+
+# How far down an exception chain `aws_error_code` will look for the AWS code.
+# Real chains are one or two links deep; the bound exists so a cycle cannot hang us.
+_MAX_CAUSE_DEPTH = 8
+
+# Round-trip status - what Amazon Bedrock did.
+STATUS_BEDROCK_SUCCESS = "BEDROCK_SUCCESS"
+STATUS_BEDROCK_SCHEMA_REFUSED = "BEDROCK_SCHEMA_REFUSED"
+STATUS_BEDROCK_UNAVAILABLE = "BEDROCK_UNAVAILABLE"
+
+# Diagnosis outcome - what the pipeline decided.
 STATUS_DIAGNOSED = "DIAGNOSED"
 STATUS_REQUIRES_HUMAN = "REQUIRES_HUMAN"
 STATUS_FAILED = "FAILED"
+
+# A real request reached Bedrock and a response came back in both of these cases.
+BEDROCK_WAS_INVOKED = frozenset({STATUS_BEDROCK_SUCCESS, STATUS_BEDROCK_SCHEMA_REFUSED})
+
+
+# ---------------------------------------------------------------------------
+# Machine-readable failure classification
+# ---------------------------------------------------------------------------
+# A human-readable message tells an operator what to do; a stable identifier lets
+# a dashboard, an alarm or a Lambda branch on the cause without parsing prose.
+# These values are part of the incident record, so they are fixed strings and
+# must not be reworded casually.
+
+FAILURE_NO_CREDENTIALS = "NO_CREDENTIALS"
+FAILURE_PARTIAL_CREDENTIALS = "PARTIAL_CREDENTIALS"
+FAILURE_ACCESS_DENIED = "ACCESS_DENIED"
+FAILURE_INVALID_MODEL = "INVALID_MODEL"
+FAILURE_VALIDATION_ERROR = "VALIDATION_ERROR"
+FAILURE_THROTTLED = "THROTTLED"
+FAILURE_TIMEOUT = "TIMEOUT"
+FAILURE_NETWORK = "NETWORK_UNREACHABLE"
+FAILURE_SERVICE_UNAVAILABLE = "SERVICE_UNAVAILABLE"
+FAILURE_CONTEXT_OVERFLOW = "CONTEXT_OVERFLOW"
+FAILURE_SCHEMA_REFUSED = "SCHEMA_REFUSED"
+FAILURE_SDK_MISSING = "SDK_MISSING"
+FAILURE_UNKNOWN = "UNKNOWN_AWS_ERROR"
+
+FAILURE_KINDS = frozenset({
+    FAILURE_NO_CREDENTIALS,
+    FAILURE_PARTIAL_CREDENTIALS,
+    FAILURE_ACCESS_DENIED,
+    FAILURE_INVALID_MODEL,
+    FAILURE_VALIDATION_ERROR,
+    FAILURE_THROTTLED,
+    FAILURE_TIMEOUT,
+    FAILURE_NETWORK,
+    FAILURE_SERVICE_UNAVAILABLE,
+    FAILURE_CONTEXT_OVERFLOW,
+    FAILURE_SCHEMA_REFUSED,
+    FAILURE_SDK_MISSING,
+    FAILURE_UNKNOWN,
+})
+
+# botocore exception class name -> kind.
+_BOTOCORE_KINDS = {
+    "NoCredentialsError": FAILURE_NO_CREDENTIALS,
+    "PartialCredentialsError": FAILURE_PARTIAL_CREDENTIALS,
+    "EndpointConnectionError": FAILURE_NETWORK,
+    "NewConnectionError": FAILURE_NETWORK,
+    "ConnectTimeoutError": FAILURE_TIMEOUT,
+    "ReadTimeoutError": FAILURE_TIMEOUT,
+    "ConnectionClosedError": FAILURE_NETWORK,
+    "HTTPClientError": FAILURE_NETWORK,
+    "UnknownServiceError": FAILURE_NETWORK,
+}
+
+# Bedrock service error code -> kind. These arrive inside a botocore ClientError,
+# whose Python class name is always "ClientError" and therefore carries no
+# information at all.
+_SERVICE_CODE_KINDS = {
+    # -- Documented errors of BedrockRuntime.Converse, verified against the
+    # -- service model shipped with the installed botocore. Every one of the nine
+    # -- is mapped, so no real Converse failure can fall through to UNKNOWN.
+    "AccessDeniedException": FAILURE_ACCESS_DENIED,          # 403
+    "InternalServerException": FAILURE_SERVICE_UNAVAILABLE,  # 500
+    "ModelErrorException": FAILURE_SERVICE_UNAVAILABLE,      # 424
+    "ModelNotReadyException": FAILURE_SERVICE_UNAVAILABLE,   # 429, model not serving yet
+    "ModelTimeoutException": FAILURE_TIMEOUT,                # 408
+    "ResourceNotFoundException": FAILURE_INVALID_MODEL,      # 404, no such model here
+    "ServiceUnavailableException": FAILURE_SERVICE_UNAVAILABLE,  # 503
+    "ThrottlingException": FAILURE_THROTTLED,                # 429
+    "ValidationException": FAILURE_VALIDATION_ERROR,         # 400
+    # Other bedrock-runtime shapes (streaming and quota paths).
+    "ModelStreamErrorException": FAILURE_SERVICE_UNAVAILABLE,
+    "ServiceQuotaExceededException": FAILURE_THROTTLED,
+    "ConflictException": FAILURE_VALIDATION_ERROR,
+    # -- AWS-wide codes from the SigV4/STS layer, which can reject the call before
+    # -- Bedrock itself ever sees it.
+    "UnrecognizedClientException": FAILURE_ACCESS_DENIED,
+    "InvalidSignatureException": FAILURE_ACCESS_DENIED,
+    "SignatureDoesNotMatch": FAILURE_ACCESS_DENIED,
+    "NotAcceptPolicyException": FAILURE_ACCESS_DENIED,
+    "ExpiredToken": FAILURE_ACCESS_DENIED,
+    "ExpiredTokenException": FAILURE_ACCESS_DENIED,
+    "InvalidClientTokenId": FAILURE_ACCESS_DENIED,
+    "AccessDenied": FAILURE_ACCESS_DENIED,
+    "MissingAuthenticationToken": FAILURE_ACCESS_DENIED,
+    "TooManyRequestsException": FAILURE_THROTTLED,
+    "RequestLimitExceeded": FAILURE_THROTTLED,
+    "SlowDown": FAILURE_THROTTLED,
+    "InternalFailure": FAILURE_SERVICE_UNAVAILABLE,
+    "ServiceUnavailable": FAILURE_SERVICE_UNAVAILABLE,
+}
+
+# Strands re-raises some Bedrock conditions as its own exception types.
+_STRANDS_KINDS = {
+    "ModelThrottledException": FAILURE_THROTTLED,
+    "ContextWindowOverflowException": FAILURE_CONTEXT_OVERFLOW,
+    "StructuredOutputException": FAILURE_SCHEMA_REFUSED,
+}
+
+
+def _code_on(exc: BaseException) -> Optional[str]:
+    """The AWS service code carried directly by this exception, if any."""
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        error = response.get("Error")
+        if isinstance(error, dict):
+            code = error.get("Code")
+            if isinstance(code, str) and code:
+                return code
+    return None
+
+
+def aws_error_code(exc: BaseException) -> Optional[str]:
+    """
+    The AWS service error code behind this failure, or None.
+
+    The exception chain is walked, because Strands re-raises some Bedrock errors as
+    its own types - a botocore `ThrottlingException` surfaces as
+    `strands.exceptions.ModelThrottledException`. Reading only the outermost
+    exception would throw away the AWS code, and an incident record that says
+    "throttled" without saying which code AWS returned is a record an operator
+    cannot cross-reference against CloudTrail.
+    """
+    seen = set()
+    current: Optional[BaseException] = exc
+    for _ in range(_MAX_CAUSE_DEPTH):
+        if current is None or id(current) in seen:
+            return None
+        seen.add(id(current))
+        code = _code_on(current)
+        if code:
+            return code
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def classify_bedrock_failure(exc: BaseException) -> str:
+    """
+    Maps any exception raised on the Bedrock path onto a stable failure kind.
+
+    Order matters, and it is deliberate:
+
+    1. Configuration errors - we never called AWS at all, so no AWS code applies.
+    2. Strands wrapper types - these are authoritative about the round trip. A
+       `StructuredOutputException` means the model DID answer and we could not
+       validate the shape; that must not be re-labelled as an AWS validation
+       error just because something in the chain looks like one.
+    3. The AWS service code, read through the exception chain.
+    4. The botocore exception class.
+
+    Nothing collapses to UNKNOWN unless it genuinely is unrecognised - and even
+    then the original code is preserved separately so the information is not lost.
+    """
+    from agent.config import AgentConfigurationError
+
+    name = type(exc).__name__
+
+    if isinstance(exc, AgentConfigurationError):
+        # SDK missing, or bedrock mode configured without a region/model.
+        return FAILURE_SDK_MISSING if "not installed" in str(exc) else FAILURE_VALIDATION_ERROR
+
+    if name in _STRANDS_KINDS:
+        return _STRANDS_KINDS[name]
+
+    code = aws_error_code(exc)
+    if code and code in _SERVICE_CODE_KINDS:
+        kind = _SERVICE_CODE_KINDS[code]
+        # "The provided model identifier is invalid" is an operator-fixable
+        # configuration problem, not a generic validation failure.
+        if kind == FAILURE_VALIDATION_ERROR and "model identifier" in str(exc).lower():
+            return FAILURE_INVALID_MODEL
+        return kind
+
+    if name in _BOTOCORE_KINDS:
+        return _BOTOCORE_KINDS[name]
+    if isinstance(exc, ValidationError):
+        return FAILURE_SCHEMA_REFUSED
+    return FAILURE_UNKNOWN
 
 
 class BedrockUnavailableError(RuntimeError):
     """
     Amazon Bedrock could not perform the diagnosis.
 
-    Always carries the underlying error class and a redacted message so the
-    incident records the true cause instead of a generic failure.
+    Carries a machine-readable `failure_kind`, the underlying AWS/Python error
+    identity, and a redacted message, so the incident records the true cause
+    instead of a generic failure.
     """
 
-    def __init__(self, message: str, error_class: Optional[str] = None):
+    def __init__(
+        self,
+        message: str,
+        error_class: Optional[str] = None,
+        failure_kind: str = FAILURE_UNKNOWN,
+        aws_error_code: Optional[str] = None,
+    ):
         super().__init__(message)
         self.error_class = error_class or "BedrockUnavailableError"
+        self.failure_kind = failure_kind if failure_kind in FAILURE_KINDS else FAILURE_UNKNOWN
+        self.aws_error_code = aws_error_code
+
+    def as_record(self) -> Dict[str, Any]:
+        """The safe, persistable part of this failure. Contains no credentials."""
+        return {
+            "failure_kind": self.failure_kind,
+            "error_class": self.error_class,
+            "aws_error_code": self.aws_error_code,
+            "error_detail": str(self)[:900],
+        }
 
 
 class AgentDiagnosis:
-    """Everything one agent invocation produced, kept separate from what it decided."""
+    """
+    Everything one agent invocation produced, kept separate from what it decided.
+
+    Two statuses, because they answer different questions:
+      `bedrock_status`     did a real model round trip succeed?
+      `status`             what should happen next (DIAGNOSED / REQUIRES_HUMAN)?
+    """
 
     def __init__(
         self,
@@ -69,17 +291,37 @@ class AgentDiagnosis:
         policy: Optional[PolicyDecision] = None,
         structured: Optional[DiagnosisResult] = None,
         incident_id: Optional[str] = None,
+        bedrock_status: str = STATUS_BEDROCK_SUCCESS,
     ):
         self.status = status
-        self.incident_id = incident_id
         self.report = report
         self.telemetry = telemetry
         self.policy = policy
         self.structured = structured
+        self.incident_id = incident_id
+        self.bedrock_status = bedrock_status
+
+    @property
+    def bedrock_invoked(self) -> bool:
+        """True only when a real request reached Bedrock and a response returned."""
+        return self.bedrock_status in BEDROCK_WAS_INVOKED
+
+    @property
+    def used_llm(self) -> bool:
+        """
+        True only when a model produced the validated diagnosis.
+
+        A schema refusal does not count: Bedrock answered, but nothing usable came
+        back, so there is no model diagnosis to claim.
+        """
+        return self.bedrock_status == STATUS_BEDROCK_SUCCESS and self.structured is not None
 
     def as_dict(self) -> Dict[str, Any]:
         out = dict(self.report)
-        out["agent_status"] = self.status
+        out["agent_status"] = self.bedrock_status
+        out["diagnosis_outcome"] = self.status
+        out["bedrock_invoked"] = self.bedrock_invoked
+        out["used_llm"] = self.used_llm
         out["agent_mode"] = self.telemetry.agent_mode
         out["telemetry"] = self.telemetry.as_dict()
         out["policy"] = self.policy.audit_event(self.incident_id) if self.policy else None
@@ -312,6 +554,8 @@ class BedrockDiagnosisAgent:
                 error_class=type(exc).__name__,
                 error_detail=self._describe(exc),
                 confidence=None,
+                failure_kind=FAILURE_SCHEMA_REFUSED,
+                aws_error_code=None,
             )
             record_log("WARN", f"{reason} Incident {incident_id}.", service="agent")
             policy = validate_diagnosis(
@@ -328,6 +572,7 @@ class BedrockDiagnosisAgent:
                 policy=policy,
                 structured=None,
                 incident_id=incident_id,
+                bedrock_status=STATUS_BEDROCK_SCHEMA_REFUSED,
             )
         except Exception as exc:
             latency = int((time.monotonic() - started) * 1000)
@@ -336,9 +581,11 @@ class BedrockDiagnosisAgent:
                 budget=budget,
                 metrics=None,
                 stop_reason=None,
-                error_class=type(exc).__name__,
+                error_class=aws_error_code(exc) or type(exc).__name__,
                 error_detail=self._describe(exc),
                 confidence=None,
+                failure_kind=classify_bedrock_failure(exc),
+                aws_error_code=aws_error_code(exc),
             )
             record_log(
                 "ERROR",
@@ -394,6 +641,7 @@ class BedrockDiagnosisAgent:
                 policy=policy,
                 structured=None,
                 incident_id=incident_id,
+                bedrock_status=STATUS_BEDROCK_SCHEMA_REFUSED,
             )
 
         # --- Policy validation -------------------------------------------
@@ -431,6 +679,8 @@ class BedrockDiagnosisAgent:
         error_class: Optional[str],
         error_detail: Optional[str],
         confidence: Optional[float],
+        failure_kind: Optional[str] = None,
+        aws_error_code: Optional[str] = None,
     ) -> AgentTelemetry:
         usage_summary = summarise_tool_use(metrics, budget) if metrics is not None else {
             "tool_calls": dict(budget.counts),
@@ -462,6 +712,8 @@ class BedrockDiagnosisAgent:
             strands_sdk_version=strands_sdk_version(),
             error_class=error_class,
             error_detail=error_detail,
+            failure_kind=failure_kind,
+            aws_error_code=aws_error_code,
         )
 
     def _report_from_structured(
@@ -548,66 +800,97 @@ class BedrockDiagnosisAgent:
         """
         Translates a real AWS/SDK failure into an honest, actionable error.
 
-        The underlying class and message are preserved (redacted) because "the
-        model failed" is not a diagnosis anyone can act on.
+        Classification happens first (`classify_bedrock_failure`) and the message
+        is then built from the resulting kind, so the machine-readable field and
+        the human-readable text can never disagree. The underlying identity is
+        preserved (redacted) because "the model failed" is not something an
+        operator can act on.
         """
-        # botocore reports every Bedrock service error as a ClientError whose
-        # real identity is in response["Error"]["Code"]; Strands additionally
-        # re-raises throttling as ModelThrottledException and context overflow as
-        # ContextWindowOverflowException. Matching only on the Python class name
-        # would turn all of those into "something failed".
+        kind = classify_bedrock_failure(exc)
+        code = aws_error_code(exc)
         name = type(exc).__name__
-        code = _aws_error_code(exc)
-        effective = code or name
         detail = self._describe(exc)
+        region = self.config.aws_region
+        model = self.config.model_id
 
-        if name in ("NoCredentialsError", "PartialCredentialsError"):
+        if kind == FAILURE_NO_CREDENTIALS:
             message = (
                 "No AWS credentials were found in the default credential chain "
                 "(environment, shared config, IAM role, IMDS). Configure credentials for a "
                 "role with bedrock:InvokeModelWithResponseStream, or run with "
-                "AI_DOCTOR_AGENT_MODE=deterministic for offline operation. "
+                f"AI_DOCTOR_AGENT_MODE=deterministic for offline operation. Underlying error: {detail}"
+            )
+        elif kind == FAILURE_PARTIAL_CREDENTIALS:
+            message = (
+                "The AWS credential chain returned an incomplete credential set (for example "
+                "an access key ID without a secret access key, or a temporary credential "
+                f"missing its session token). Underlying error: {detail}"
+            )
+        elif kind == FAILURE_ACCESS_DENIED:
+            message = (
+                f"AWS rejected this Bedrock call{f' ({code})' if code else ''}. The principal needs "
+                f"bedrock:InvokeModelWithResponseStream on model {model!r} in {region!r}, and the "
+                f"model must be enabled for that account. Underlying error: {detail}"
+            )
+        elif kind == FAILURE_INVALID_MODEL:
+            message = (
+                f"Bedrock model {model!r} is not valid or not enabled in {region!r}. Set "
+                f"AI_DOCTOR_BEDROCK_MODEL_ID to a model your account can invoke in that region. "
                 f"Underlying error: {detail}"
             )
-        elif effective in ("EndpointConnectionError", "ConnectTimeoutError", "ReadTimeoutError",
-                           "NewConnectionError", "ConnectTimeoutError"):
+        elif kind == FAILURE_THROTTLED:
             message = (
-                f"Amazon Bedrock in region {self.config.aws_region!r} could not be reached "
-                f"from this network. Underlying error: {detail}"
-            )
-        elif effective in ("AccessDeniedException", "UnrecognizedClientException",
-                           "InvalidSignatureException", "NotAcceptPolicyException"):
-            message = (
-                "AWS rejected the credentials for this Bedrock call. The principal needs "
-                f"bedrock:InvokeModelWithResponseStream on model {self.config.model_id!r} in "
-                f"{self.config.aws_region!r}. Underlying error: {detail}"
-            )
-        elif effective == "ValidationException" and "model identifier" in detail.lower():
-            message = (
-                f"Bedrock model {self.config.model_id!r} is not valid or not enabled in "
-                f"{self.config.aws_region!r}. Set AI_DOCTOR_BEDROCK_MODEL_ID to an enabled "
-                f"model. Underlying error: {detail}"
-            )
-        elif effective in ("ModelTimeoutException", "ModelNotReadyException", "ServiceUnavailableException"):
-            message = f"Bedrock model did not respond in time. Underlying error: {detail}"
-        elif effective in ("ThrottlingException", "throttlingException") or name == "ModelThrottledException":
-            message = (
-                f"Bedrock throttled the request to model {self.config.model_id!r} in "
-                f"{self.config.aws_region!r} and the bounded retry budget "
-                f"({self.config.max_model_attempts} attempt(s)) was exhausted. "
+                f"Bedrock throttled the request to model {model!r} in {region!r} and the bounded "
+                f"retry budget ({self.config.max_model_attempts} attempt(s)) was exhausted. Raise "
+                f"AI_DOCTOR_AGENT_MAX_MODEL_ATTEMPTS only if you accept the added latency. "
                 f"Underlying error: {detail}"
             )
-        elif name == "ContextWindowOverflowException":
+        elif kind == FAILURE_TIMEOUT:
+            message = (
+                f"Bedrock did not respond within {self.config.request_timeout_seconds}s "
+                f"(AI_DOCTOR_AGENT_TIMEOUT_SECONDS). Underlying error: {detail}"
+            )
+        elif kind == FAILURE_NETWORK:
+            message = (
+                f"Amazon Bedrock in region {region!r} could not be reached from this network. "
+                f"Check egress to bedrock-runtime.{region}.amazonaws.com. Underlying error: {detail}"
+            )
+        elif kind == FAILURE_SERVICE_UNAVAILABLE:
+            message = (
+                f"Amazon Bedrock could not serve model {model!r} in {region!r} just now "
+                f"{f'({code})' if code else ''}. This is a service-side or not-yet-ready "
+                f"condition: retry after a short backoff, and confirm in the Bedrock console "
+                f"that the model is available in that region. Underlying error: {detail}"
+            )
+        elif kind == FAILURE_CONTEXT_OVERFLOW:
             message = (
                 "The prompt exceeded the model's context window. Lower AI_DOCTOR_MAX_EVIDENCE_BYTES, "
                 f"AI_DOCTOR_MAX_LOG_LINES or AI_DOCTOR_MAX_PROMPT_CHARS. Underlying error: {detail}"
             )
+        elif kind == FAILURE_SDK_MISSING:
+            message = (
+                "AI_DOCTOR_AGENT_MODE=bedrock was requested but the AWS Strands Agents SDK is not "
+                f"installed. Install with: pip install -r requirements-aws.txt. Underlying error: {detail}"
+            )
+        elif kind == FAILURE_VALIDATION_ERROR:
+            message = (
+                f"Bedrock rejected the request{f' ({code})' if code else ''}. Underlying error: {detail}"
+            )
         else:
-            message = f"{prefix}: {detail}"
+            # UNKNOWN_AWS_ERROR. The service code is named explicitly rather than
+            # collapsed into a generic message, so an unrecognised failure is
+            # still searchable in CloudTrail.
+            identity = code or name
+            message = (
+                f"{prefix}: unrecognised AWS/Bedrock failure ({identity}). "
+                f"Model {model!r}, region {region!r}. Underlying error: {detail}"
+            )
 
-        # The AWS service code where there is one, otherwise the Python class:
-        # both are what an operator would search for in CloudTrail.
-        return BedrockUnavailableError(message, error_class=effective)
+        # error_class keeps the AWS service code where there is one, otherwise the
+        # Python class: both are what an operator would search CloudTrail for.
+        return BedrockUnavailableError(
+            message, error_class=code or name, failure_kind=kind, aws_error_code=code
+        )
 
     def describe(self) -> Dict[str, Any]:
         """Non-secret description of this agent, for telemetry and the dashboard."""
@@ -621,18 +904,6 @@ class BedrockDiagnosisAgent:
             "tools_exposed": list(ALLOWED_TOOL_NAMES),
             "uses_llm": True,
         }
-
-
-def _aws_error_code(exc: BaseException) -> Optional[str]:
-    """The AWS service error code inside a botocore ClientError, if there is one."""
-    response = getattr(exc, "response", None)
-    if isinstance(response, dict):
-        error = response.get("Error")
-        if isinstance(error, dict):
-            code = error.get("Code")
-            if isinstance(code, str) and code:
-                return code
-    return None
 
 
 def _int_or_none(value: Any) -> Optional[int]:

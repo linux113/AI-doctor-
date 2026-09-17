@@ -35,7 +35,24 @@ from agent.diagnosis_agent import (
     describe_agent,
     run_diagnosis,
 )
-from agent.strands_agent import STATUS_DIAGNOSED, STATUS_REQUIRES_HUMAN, BedrockUnavailableError
+from agent.strands_agent import (
+    FAILURE_ACCESS_DENIED,
+    FAILURE_SCHEMA_REFUSED,
+    FAILURE_SERVICE_UNAVAILABLE,
+    FAILURE_VALIDATION_ERROR,
+    FAILURE_INVALID_MODEL,
+    FAILURE_KINDS,
+    FAILURE_NO_CREDENTIALS,
+    FAILURE_PARTIAL_CREDENTIALS,
+    FAILURE_THROTTLED,
+    FAILURE_TIMEOUT,
+    FAILURE_UNKNOWN,
+    STATUS_BEDROCK_SUCCESS,
+    STATUS_BEDROCK_UNAVAILABLE,
+    STATUS_DIAGNOSED,
+    STATUS_REQUIRES_HUMAN,
+    BedrockUnavailableError,
+)
 from backend.models import Incident
 from runner.doctor_runner import doctor_runner
 
@@ -232,7 +249,11 @@ def test_run_diagnosis_in_bedrock_mode_reports_a_model_diagnosis(monkeypatch):
                             config=bedrock_config())
     assert outcome.agent_mode == MODE_BEDROCK
     assert outcome.used_llm is True
-    assert outcome.status == STATUS_DIAGNOSED
+    # The round trip succeeded AND the pipeline reached a decision. Two separate
+    # facts, two separate fields - see test_status_split_is_not_collapsed.
+    assert outcome.status == STATUS_BEDROCK_SUCCESS
+    assert outcome.diagnosis_outcome == STATUS_DIAGNOSED
+    assert outcome.bedrock_invoked is True
     assert outcome.report["recommended_remediation"] == "start_ollama"
     assert outcome.policy_event["layer"] == "agent_policy"
     assert "Amazon Bedrock" in outcome.report["agent_note"]
@@ -288,7 +309,9 @@ def test_fallback_disabled_means_no_action_and_no_substitution(no_credentials):
     config = bedrock_config(fallback="fail")
     outcome = run_diagnosis(INCIDENT, DOWN_EVIDENCE, "inc-nofallback", config=config)
 
-    assert outcome.status == "FAILED"
+    assert outcome.status == "BEDROCK_UNAVAILABLE", "the round trip did not happen"
+    assert outcome.diagnosis_outcome == "FAILED", "and nothing substituted for it"
+    assert outcome.bedrock_invoked is False
     assert outcome.agent_mode == MODE_BEDROCK, "the incident should still record that bedrock was asked for"
     assert outcome.used_llm is False
     assert outcome.report["recommended_remediation"] == "none"
@@ -313,7 +336,10 @@ def test_runner_path_with_fallback_disabled_approves_no_action(no_credentials, m
 
     report = doctor_runner.diagnose_incident(INCIDENT, DETERMINISTIC_EVIDENCE, "boom", "inc-nofb")
     assert report["agent_mode"] == MODE_BEDROCK
-    assert report["agent_status"] == "FAILED"
+    assert report["agent_status"] == "BEDROCK_UNAVAILABLE"
+    assert report["diagnosis_outcome"] == "FAILED"
+    assert report["bedrock_invoked"] is False
+    assert report["used_llm"] is False
     assert report["recommended_remediation"] == "none"
     assert report["requires_human"] is True
     assert report["used_llm"] is False
@@ -378,37 +404,157 @@ def test_unreachable_endpoint_is_reported_as_unreachable(no_credentials, monkeyp
     assert "could not be reached" in str(exc.value)
 
 
+# Every documented error of BedrockRuntime.Converse, verified against the service
+# model shipped with the installed botocore, plus the botocore/credential classes
+# that can fail the call before or instead of a service response.
+#
+# (AWS failure, message, stable machine-readable kind, human fragment)
+#
+# The kind is what a dashboard branches on; the fragment is what an operator
+# reads. Both are asserted, because a message alone cannot be acted on by code
+# and a code alone cannot be acted on by a human.
+AWS_FAILURE_CASES = [
+    # --- the nine documented Converse errors (HTTP status in the comment) ------
+    ("AccessDeniedException", "not authorised",           # 403
+     FAILURE_ACCESS_DENIED, "bedrock:InvokeModelWithResponseStream"),
+    ("InternalServerException", "internal error",         # 500
+     FAILURE_SERVICE_UNAVAILABLE, "could not serve model"),
+    ("ModelErrorException", "model errored",              # 424
+     FAILURE_SERVICE_UNAVAILABLE, "could not serve model"),
+    ("ModelNotReadyException", "still onboarding",        # 429
+     FAILURE_SERVICE_UNAVAILABLE, "retry after a short backoff"),
+    ("ModelTimeoutException", "model timed out",          # 408
+     FAILURE_TIMEOUT, "AI_DOCTOR_AGENT_TIMEOUT_SECONDS"),
+    ("ResourceNotFoundException", "no such model here",   # 404
+     FAILURE_INVALID_MODEL, "AI_DOCTOR_BEDROCK_MODEL_ID"),
+    ("ServiceUnavailableException", "try later",          # 503
+     FAILURE_SERVICE_UNAVAILABLE, "retry after a short backoff"),
+    # Strands re-raises Bedrock throttling as ModelThrottledException once the
+    # bounded retry budget is spent. The AWS code must still be recoverable from
+    # the chain - see test_a_strands_wrapper_does_not_erase_the_aws_error_code.
+    ("ThrottlingException", "rate exceeded",              # 429
+     FAILURE_THROTTLED, "throttled"),
+    ("ValidationException", "bad request shape",          # 400
+     FAILURE_VALIDATION_ERROR, "Bedrock rejected the request"),
+    # A ValidationException about the model id is an operator-fixable config bug,
+    # not a generic 400.
+    ("ValidationException", "The provided model identifier is invalid",
+     FAILURE_INVALID_MODEL, "is not valid or not enabled"),
+    # --- credential problems raised by botocore itself, never a service code ---
+    ("NoCredentialsError", "Unable to locate credentials",
+     FAILURE_NO_CREDENTIALS, "No AWS credentials were found"),
+    ("PartialCredentialsError", "Incomplete credentials",
+     FAILURE_PARTIAL_CREDENTIALS, "incomplete credential set"),
+    # --- AWS-wide SigV4/STS rejections that can precede any Bedrock response ---
+    ("ExpiredToken", "token expired",
+     FAILURE_ACCESS_DENIED, "bedrock:InvokeModelWithResponseStream"),
+    ("SignatureDoesNotMatch", "bad signature",
+     FAILURE_ACCESS_DENIED, "bedrock:InvokeModelWithResponseStream"),
+]
+
+# Codes botocore carries in the ClientError payload rather than as a Python class.
+_BOTOCORE_CODED = {case[0] for case in AWS_FAILURE_CASES} - {
+    "NoCredentialsError", "PartialCredentialsError"}
+
+
 @pytest.mark.parametrize(
-    "error_class,message,expected_fragment",
-    [
-        ("NoCredentialsError", "Unable to locate credentials", "No AWS credentials were found"),
-        ("AccessDeniedException", "not authorised", "rejected the credentials"),
-        ("ValidationException", "model identifier is invalid", "is not valid or not enabled"),
-        # Strands re-raises Bedrock throttling as ModelThrottledException after the
-    # bounded retry budget is spent, which is why the fragment is about throttling
-    # rather than the raw AWS code.
-    ("ThrottlingException", "rate exceeded", "throttled"),
-        ("ModelTimeoutException", "model timed out", "did not respond in time"),
-    ],
+    "error_class,message,expected_kind,expected_fragment", AWS_FAILURE_CASES,
+    ids=[case[2] + ":" + case[0] + ":" + case[1][:12].replace(" ", "_") for case in AWS_FAILURE_CASES],
 )
-def test_aws_failures_are_translated_into_actionable_messages(error_class, message, expected_fragment):
+def test_aws_failures_are_classified_and_translated(error_class, message, expected_kind,
+                                                    expected_fragment):
     """
-    "The model failed" is not something an operator can act on. Each real AWS
-    failure class must produce a message naming the fix.
+    "The model failed" is not something an operator can act on, and "AWS_ERROR" is
+    not something a dashboard can branch on. Every real AWS failure must produce
+    BOTH a stable machine-readable kind AND a message naming the fix.
     """
-    exc = type(error_class, (Exception,), {})
-    if error_class in ("AccessDeniedException", "ValidationException", "ThrottlingException",
-                       "ModelTimeoutException"):
-        # botocore ClientError carries the code in its payload.
+    if error_class in _BOTOCORE_CODED:
         from botocore.exceptions import ClientError
 
         exc = ClientError({"Error": {"Code": error_class, "Message": message}}, "Converse")
+    else:
+        # botocore raises these as real exception classes, not as ClientError.
+        exc = type(error_class, (Exception,), {})(message)
 
     agent = make_transport_agent(bedrock_config(), FakeBedrockTransport(error=exc))
     with pytest.raises(BedrockUnavailableError) as raised:
         agent.diagnose(INCIDENT, DOWN_EVIDENCE, BASELINE, "inc-translate")
-    assert expected_fragment in str(raised.value), str(raised.value)
-    assert raised.value.error_class
+
+    failure = raised.value
+    # Machine-readable: a stable, published kind; the AWS code preserved not lost.
+    assert failure.failure_kind == expected_kind
+    assert failure.failure_kind in FAILURE_KINDS
+    assert failure.as_record()["failure_kind"] == expected_kind
+    if error_class in _BOTOCORE_CODED:
+        assert failure.aws_error_code == error_class, "the AWS code must survive"
+        assert failure.error_class == error_class
+    # Human-readable: names the fix.
+    assert expected_fragment in str(failure), str(failure)
+    # And nothing in any of it may carry the secret-bearing message text unredacted.
+    assert "AKIA" not in str(failure)
+
+
+def test_a_strands_wrapper_does_not_erase_the_aws_error_code():
+    """
+    Strands re-raises some Bedrock errors as its own exception types. If we read
+    only the outermost exception, the AWS service code is lost and the incident
+    record can no longer be cross-referenced against CloudTrail. The chain must be
+    walked - but only for the code, never to override what the wrapper means.
+    """
+    from botocore.exceptions import ClientError
+
+    inner = ClientError({"Error": {"Code": "ThrottlingException", "Message": "rate"}}, "Converse")
+    try:
+        raise ClientError({"Error": {"Code": "ThrottlingException", "Message": "rate"}}, "Converse") from inner
+    except Exception as wrapped:  # noqa: BLE001 - the point is the chain
+        agent = make_transport_agent(bedrock_config(), FakeBedrockTransport(error=wrapped))
+        with pytest.raises(BedrockUnavailableError) as raised:
+            agent.diagnose(INCIDENT, DOWN_EVIDENCE, BASELINE, "inc-chain")
+
+    assert raised.value.failure_kind == FAILURE_THROTTLED
+    assert raised.value.aws_error_code == "ThrottlingException"
+
+
+def test_a_schema_refusal_is_never_relabelled_as_an_aws_validation_error():
+    """
+    Precedence guard. `StructuredOutputException` means the model answered in the
+    wrong shape - a real round trip happened. Even with an AWS-looking error in its
+    chain, the kind must stay SCHEMA_REFUSED, otherwise the incident would claim an
+    outage where a model reply actually arrived.
+    """
+    from botocore.exceptions import ClientError
+
+    inner = ClientError({"Error": {"Code": "ValidationException", "Message": "x"}}, "Converse")
+    try:
+        raise type("StructuredOutputException", (Exception,), {})("bad shape") from inner
+    except Exception as wrapped:  # noqa: BLE001
+        agent = make_transport_agent(bedrock_config(), FakeBedrockTransport(error=wrapped))
+        with pytest.raises(BedrockUnavailableError) as raised:
+            agent.diagnose(INCIDENT, DOWN_EVIDENCE, BASELINE, "inc-precedence")
+
+    assert raised.value.failure_kind == FAILURE_SCHEMA_REFUSED
+    assert raised.value.aws_error_code == "ValidationException", "the code is still recorded"
+
+
+def test_an_unrecognised_aws_code_is_named_not_collapsed():
+    """
+    AWS adds error codes without asking. An unrecognised code must still be
+    classified (UNKNOWN_AWS_ERROR), must still carry the original code so nothing
+    is lost, and must still produce a readable message. Collapsing every surprise
+    into one opaque "AWS error" is exactly the failure mode this prevents.
+    """
+    from botocore.exceptions import ClientError
+
+    code = "SomeBrandNewBedrockCode"
+    exc = ClientError({"Error": {"Code": code, "Message": "the future"}}, "Converse")
+    agent = make_transport_agent(bedrock_config(), FakeBedrockTransport(error=exc))
+    with pytest.raises(BedrockUnavailableError) as raised:
+        agent.diagnose(INCIDENT, DOWN_EVIDENCE, BASELINE, "inc-new-code")
+
+    failure = raised.value
+    assert failure.failure_kind == FAILURE_UNKNOWN
+    assert failure.aws_error_code == code, "the original AWS code must survive classification"
+    assert code in str(failure), "and must be visible to the operator"
 
 
 # =========================================================================
@@ -427,8 +573,10 @@ def test_agent_mode_bedrock_only_ever_appears_with_a_real_model_call(mode, no_cr
     outcome = run_diagnosis(INCIDENT, DETERMINISTIC_EVIDENCE, "inc-invariant", config=config)
 
     if outcome.telemetry.agent_mode == MODE_BEDROCK:
-        assert outcome.used_llm or outcome.status == "FAILED"
+        assert outcome.used_llm or outcome.diagnosis_outcome == "FAILED"
         assert outcome.bedrock_failure is not None or outcome.telemetry.model_id
+        # used_llm is only ever true with a real round trip behind it.
+        assert not outcome.used_llm or outcome.bedrock_invoked
     else:
         assert outcome.used_llm is False
         assert outcome.telemetry.model_id is None

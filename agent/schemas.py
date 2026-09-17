@@ -114,6 +114,12 @@ class AgentTelemetry(BaseModel):
     # Set only when the Bedrock path failed. Names the real cause.
     error_class: Optional[str] = None
     error_detail: Optional[str] = None
+    # Machine-readable failure category from agent.strands_agent.FAILURE_KINDS,
+    # plus the raw AWS service code when Bedrock returned one. A dashboard or
+    # alarm can branch on `failure_kind` without parsing prose, and the code is
+    # what an operator searches for in CloudTrail.
+    failure_kind: Optional[str] = None
+    aws_error_code: Optional[str] = None
 
     def as_dict(self) -> Dict[str, Any]:
         return self.model_dump()

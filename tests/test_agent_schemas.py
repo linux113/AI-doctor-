@@ -200,12 +200,19 @@ def test_telemetry_field_set_carries_no_prompt_or_credential_surface():
         "tool_calls", "tool_call_count", "turns", "input_tokens", "output_tokens",
         "total_tokens", "bedrock_request_id", "stop_reason", "strands_sdk_version",
         "error_class", "error_detail",
+        # Failure classification: a stable machine-readable kind, and the AWS
+        # service code behind it. Both are identifiers, never free text or secrets.
+        "failure_kind", "aws_error_code",
     }
     assert set(AgentTelemetry.model_fields) == allowed
 
     forbidden = {"prompt", "system_prompt", "messages", "evidence", "credentials",
                  "aws_access_key_id", "aws_secret_access_key", "session_token", "request_body"}
     assert not (forbidden & set(AgentTelemetry.model_fields))
+
+    # The classification fields are optional strings - a successful call has neither.
+    for field in ("failure_kind", "aws_error_code"):
+        assert AgentTelemetry.model_fields[field].is_required() is False, field
 
 
 def test_telemetry_rejects_unknown_fields():

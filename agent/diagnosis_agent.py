@@ -47,19 +47,29 @@ from .config import (
 )
 from .schemas import AgentTelemetry
 from .strands_agent import (
+    FAILURE_SDK_MISSING,
+    STATUS_BEDROCK_SCHEMA_REFUSED,
+    STATUS_BEDROCK_SUCCESS,
+    STATUS_BEDROCK_UNAVAILABLE,
     STATUS_DIAGNOSED,
     STATUS_FAILED,
     STATUS_REQUIRES_HUMAN,
     BedrockDiagnosisAgent,
     BedrockUnavailableError,
+    classify_bedrock_failure,
 )
 
-# Reported on every outcome so a consumer can branch on how the answer was made.
+# Round-trip statuses for the paths that never reach Bedrock. The Bedrock ones
+# (BEDROCK_SUCCESS / BEDROCK_SCHEMA_REFUSED / BEDROCK_UNAVAILABLE) live in
+# agent.strands_agent next to the code that produces them.
 STATUS_DETERMINISTIC = "DETERMINISTIC"
 STATUS_FALLBACK_DETERMINISTIC = "FALLBACK_DETERMINISTIC"
 
-# The shared report contract. Asserted against both producers in the tests, so
-# adding a field to one engine without the other fails loudly.
+# The shared DIAGNOSIS contract - exactly the keys of
+# `runner.diagnosis.Diagnosis.as_dict()`. Both producers must emit these, so the
+# runner, the API and the dashboard need only one code path. Asserted against the
+# engine in the tests, so adding a field to one producer without the other fails
+# loudly.
 REPORT_CONTRACT_KEYS: tuple = (
     "root_cause",
     "recommended_remediation",
@@ -73,6 +83,17 @@ REPORT_CONTRACT_KEYS: tuple = (
     "runtime_state",
 )
 
+# The PROVENANCE contract - which engine answered, and whether a real model round
+# trip happened. Present on every outcome regardless of mode, because a report
+# that omits them is a report a reader can misattribute.
+AGENT_RECORD_KEYS: tuple = (
+    "agent_mode",
+    "agent_status",
+    "diagnosis_outcome",
+    "bedrock_invoked",
+    "used_llm",
+)
+
 
 class AgentOutcome:
     """A diagnosis plus an unambiguous statement of how it was produced."""
@@ -84,12 +105,18 @@ class AgentOutcome:
         status: str,
         policy_event: Optional[Dict[str, Any]] = None,
         bedrock_failure: Optional[Dict[str, Any]] = None,
+        diagnosis_outcome: str = STATUS_FAILED,
+        bedrock_invoked: bool = False,
     ):
         self.report = report
         self.telemetry = telemetry
+        # `status` is the ROUND TRIP: what Bedrock (or the offline engine) did.
         self.status = status
         self.policy_event = policy_event
         self.bedrock_failure = bedrock_failure
+        # `diagnosis_outcome` is the DECISION: DIAGNOSED or REQUIRES_HUMAN.
+        self.diagnosis_outcome = diagnosis_outcome
+        self.bedrock_invoked = bedrock_invoked
 
     @property
     def agent_mode(self) -> str:
@@ -97,15 +124,23 @@ class AgentOutcome:
 
     @property
     def used_llm(self) -> bool:
-        """True only when a model actually returned this diagnosis."""
-        return self.telemetry.agent_mode == MODE_BEDROCK and self.status in (
-            STATUS_DIAGNOSED,
-            STATUS_REQUIRES_HUMAN,
+        """
+        True only when a real model round trip produced this diagnosis.
+
+        A schema refusal does not count: Bedrock answered, but nothing usable
+        came back, so no model diagnosis exists to claim.
+        """
+        return (
+            self.telemetry.agent_mode == MODE_BEDROCK
+            and self.status == STATUS_BEDROCK_SUCCESS
+            and self.diagnosis_outcome in (STATUS_DIAGNOSED, STATUS_REQUIRES_HUMAN)
         )
 
     def as_dict(self) -> Dict[str, Any]:
         out = dict(self.report)
         out["agent_status"] = self.status
+        out["diagnosis_outcome"] = self.diagnosis_outcome
+        out["bedrock_invoked"] = self.bedrock_invoked
         out["agent_telemetry"] = self.telemetry.as_dict()
         out["policy_event"] = self.policy_event
         out["bedrock_failure"] = self.bedrock_failure
@@ -147,7 +182,9 @@ def run_diagnosis(
 
     if not strands_sdk_available():
         failure = {
+            "failure_kind": FAILURE_SDK_MISSING,
             "error_class": "AgentConfigurationError",
+            "aws_error_code": None,
             "error_detail": (
                 "AI_DOCTOR_AGENT_MODE=bedrock was requested but the AWS Strands Agents SDK "
                 "is not installed. Install with: pip install -r requirements-aws.txt"
@@ -162,33 +199,53 @@ def run_diagnosis(
         agent = BedrockDiagnosisAgent(config)
         result = agent.diagnose(incident_data, evidence, baseline, incident_id)
     except (BedrockUnavailableError, AgentConfigurationError) as exc:
+        # Machine-readable first: `failure_kind` is a stable identifier a
+        # dashboard or alarm can branch on, `error_class` and `aws_error_code`
+        # preserve the underlying AWS identity for CloudTrail lookups.
+        kind = getattr(exc, "failure_kind", None) or classify_bedrock_failure(exc)
         failure = {
+            "failure_kind": kind,
             "error_class": getattr(exc, "error_class", type(exc).__name__),
+            "aws_error_code": getattr(exc, "aws_error_code", None),
             "error_detail": sanitize_deep(str(exc))[:900],
             "attempted_model_id": config.model_id,
             "attempted_region": config.aws_region,
         }
         record_log(
             "ERROR",
-            f"Bedrock diagnosis unavailable for incident {incident_id}: "
-            f"{failure['error_class']}: {failure['error_detail']}",
+            f"Bedrock diagnosis unavailable for incident {incident_id} "
+            f"[{failure['failure_kind']}]: {failure['error_class']}: {failure['error_detail']}",
             service="agent",
         )
         return _handle_bedrock_failure(baseline, config, started, failure, incident_id)
 
-    # A real model answer. agent_mode is bedrock because Bedrock was invoked.
+    # A real model round trip. agent_mode is bedrock because Bedrock answered;
+    # agent_status records the round trip, diagnosis_outcome records the decision.
     report = dict(result.report)
     report["agent_mode"] = MODE_BEDROCK
-    report["agent_status"] = result.status
-    report["agent_note"] = (
-        f"Diagnosis produced by Amazon Bedrock model {config.model_id} in "
-        f"{config.aws_region} through the AWS Strands Agents SDK "
-        f"({result.telemetry.turns} turn(s), {result.telemetry.tool_call_count} tool call(s))."
-    )
+    report["agent_status"] = result.bedrock_status
+    report["diagnosis_outcome"] = result.status
+    report["bedrock_invoked"] = result.bedrock_invoked
+    report["used_llm"] = result.used_llm
+    if result.bedrock_status == STATUS_BEDROCK_SUCCESS:
+        report["agent_note"] = (
+            f"Diagnosis produced by Amazon Bedrock model {config.model_id} in "
+            f"{config.aws_region} through the AWS Strands Agents SDK "
+            f"({result.telemetry.turns} turn(s), {result.telemetry.tool_call_count} tool call(s), "
+            f"request {result.telemetry.bedrock_request_id or 'id unavailable'})."
+        )
+    else:
+        report["agent_note"] = (
+            f"Amazon Bedrock model {config.model_id} in {config.aws_region} was reached but "
+            "did not return a schema-valid DiagnosisResult. No model diagnosis is claimed and "
+            "no action was approved."
+        )
     return AgentOutcome(
         report=_with_contract(report),
         telemetry=result.telemetry,
-        status=result.status,
+        status=result.bedrock_status,
+        diagnosis_outcome=result.status,
+        bedrock_invoked=result.bedrock_invoked,
         policy_event=result.policy.audit_event(incident_id) if result.policy else None,
     )
 
@@ -220,10 +277,14 @@ def _handle_bedrock_failure(
                 "confidence": 0.0,
                 "requires_human": True,
                 "agent_mode": MODE_BEDROCK,
-                "agent_status": STATUS_FAILED,
+                "agent_status": STATUS_BEDROCK_UNAVAILABLE,
+                "diagnosis_outcome": STATUS_FAILED,
+                "bedrock_invoked": False,
+                "used_llm": False,
                 "notes": None,
                 "agent_note": (
-                    "Amazon Bedrock could not perform the diagnosis and "
+                    f"Amazon Bedrock could not perform the diagnosis "
+                    f"[{failure['failure_kind']}:{failure['error_class']}] and "
                     "AI_DOCTOR_AGENT_FALLBACK=fail forbids substituting the offline "
                     "engine. No remediation was attempted."
                 ),
@@ -238,7 +299,9 @@ def _handle_bedrock_failure(
         return AgentOutcome(
             report=_with_contract(report),
             telemetry=telemetry,
-            status=STATUS_FAILED,
+            status=STATUS_BEDROCK_UNAVAILABLE,
+            diagnosis_outcome=STATUS_FAILED,
+            bedrock_invoked=False,
             bedrock_failure=failure,
         )
 
@@ -248,14 +311,18 @@ def _handle_bedrock_failure(
         {
             "agent_mode": MODE_DETERMINISTIC,
             "agent_status": STATUS_FALLBACK_DETERMINISTIC,
+            "diagnosis_outcome": STATUS_DIAGNOSED,
+            "bedrock_invoked": False,
+            "used_llm": False,
             # `notes` is left exactly as the rule engine wrote it - the engine
             # really did produce this answer, so its reasoning is the reasoning.
             # The substitution is stated separately, where it cannot be missed
             # and cannot be mistaken for the engine's own words.
             "agent_note": (
                 f"Amazon Bedrock was requested but could not be used "
-                f"({failure['error_class']}). This diagnosis came from the offline "
-                "deterministic rule engine in runner/diagnosis.py, not from a model."
+                f"[{failure['failure_kind']}:{failure['error_class']}]. This diagnosis came "
+                "from the offline deterministic rule engine in runner/diagnosis.py, not from "
+                "a model."
             ),
             "bedrock_failure": failure,
         }
@@ -271,6 +338,8 @@ def _handle_bedrock_failure(
         report=_with_contract(report),
         telemetry=telemetry,
         status=STATUS_FALLBACK_DETERMINISTIC,
+        diagnosis_outcome=STATUS_DIAGNOSED,
+        bedrock_invoked=False,
         bedrock_failure=failure,
     )
 
@@ -281,6 +350,9 @@ def _deterministic_outcome(
     report = dict(baseline)
     report["agent_mode"] = MODE_DETERMINISTIC
     report["agent_status"] = status
+    report["diagnosis_outcome"] = STATUS_DIAGNOSED
+    report["bedrock_invoked"] = False
+    report["used_llm"] = False
     report["agent_note"] = (
         "Deterministic offline rule engine: no model was invoked and no AWS call "
         "was made. Set AI_DOCTOR_AGENT_MODE=bedrock for a model diagnosis."
@@ -289,6 +361,8 @@ def _deterministic_outcome(
         report=_with_contract(report),
         telemetry=_deterministic_telemetry(config, started, baseline),
         status=status,
+        diagnosis_outcome=STATUS_DIAGNOSED,
+        bedrock_invoked=False,
     )
 
 
@@ -323,13 +397,17 @@ def _deterministic_telemetry(
         strands_sdk_version=strands_sdk_version() if strands_sdk_available() else None,
         error_class=(error or {}).get("error_class"),
         error_detail=(error or {}).get("error_detail"),
+        failure_kind=(error or {}).get("failure_kind"),
+        aws_error_code=(error or {}).get("aws_error_code"),
     )
 
 
 def _with_contract(report: Dict[str, Any]) -> Dict[str, Any]:
-    """Guarantees the shared report keys exist, whatever produced the report."""
+    """Guarantees both contracts are satisfied, whatever produced the report."""
     out = dict(report)
     for key in REPORT_CONTRACT_KEYS:
+        out.setdefault(key, None)
+    for key in AGENT_RECORD_KEYS:
         out.setdefault(key, None)
     return out
 
