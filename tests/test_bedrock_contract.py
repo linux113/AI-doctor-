@@ -49,6 +49,7 @@ from _fake_bedrock import (
     BASELINE,
     DOWN_EVIDENCE,
     INCIDENT,
+    WELL_FORMED_REPLY,
     FakeBedrockTransport,
     bedrock_config,
     make_transport_agent,
@@ -391,6 +392,84 @@ def test_no_env_file_or_credential_file_is_committed():
     for name in (".env", ".env.local", ".env.production", "credentials", "aws_credentials.csv"):
         assert not (REPO_ROOT / name).exists(), f"{name} must never be committed"
     assert not (REPO_ROOT / ".git" / "credentials").exists()
+
+
+def test_absent_token_usage_is_recorded_as_null_not_zero():
+    """
+    Requirement: record token counts IF PROVIDED, otherwise record null rather
+    than fabricate a number.
+
+    Strands accumulates usage onto a zero-initialised counter, so a response with
+    no usage block used to be recorded as 0/0/0 - a measurement that was never
+    made, and one that reads as "the model billed nothing". Absence must stay
+    visible as absence.
+    """
+    transport = FakeBedrockTransport(fields=dict(WELL_FORMED_REPLY), usage={})
+    telemetry = make_transport_agent(bedrock_config(), transport).diagnose(
+        INCIDENT, DOWN_EVIDENCE, BASELINE, "inc-no-usage"
+    ).telemetry
+
+    assert telemetry.input_tokens is None
+    assert telemetry.output_tokens is None
+    assert telemetry.total_tokens is None
+    # The rest of the round-trip record is unaffected.
+    assert telemetry.agent_mode == "bedrock"
+    assert telemetry.model_id == bedrock_config().model_id
+    assert telemetry.agent_latency_ms > 0
+
+
+def test_partial_token_usage_records_only_the_counts_that_were_provided():
+    """Per-field honesty: an absent field is null, not zero and not inferred."""
+    transport = FakeBedrockTransport(fields=dict(WELL_FORMED_REPLY), usage={"inputTokens": 11})
+    telemetry = make_transport_agent(bedrock_config(), transport).diagnose(
+        INCIDENT, DOWN_EVIDENCE, BASELINE, "inc-partial-usage"
+    ).telemetry
+
+    assert telemetry.input_tokens == 11
+    assert telemetry.output_tokens is None, "a count the service never sent was invented"
+    assert telemetry.total_tokens is None, "and so was a total derived from it"
+
+
+def test_reported_token_usage_is_recorded_verbatim():
+    """When the service does report usage, it must be passed through unchanged."""
+    usage = {"inputTokens": 1234, "outputTokens": 210, "totalTokens": 1444}
+    transport = FakeBedrockTransport(fields=dict(WELL_FORMED_REPLY), usage=dict(usage))
+    telemetry = make_transport_agent(bedrock_config(), transport).diagnose(
+        INCIDENT, DOWN_EVIDENCE, BASELINE, "inc-full-usage"
+    ).telemetry
+
+    assert telemetry.input_tokens == usage["inputTokens"]
+    assert telemetry.output_tokens == usage["outputTokens"]
+    assert telemetry.total_tokens == usage["totalTokens"]
+
+
+def test_credential_source_hint_names_sources_and_never_their_values(monkeypatch):
+    """
+    `credential_source_hint` feeds /api/system-status and the dashboard banner, so
+    it is on the exposure path. It must report WHICH sources appear configured and
+    never any part of a credential - not the key, not a prefix, not a length that
+    would let one be recognised.
+    """
+    from agent.config import credential_source_hint
+
+    # Distinctive values, so any fragment of them in the output is unmistakable.
+    access_key_id = "AKIA" + "IOSFODNN7DONOTLK"
+    secret = "wJalrXUtnFEMI-DoNotLeak-9f3c"
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", access_key_id)
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", secret)
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "SessionValue-DoNotLeak")
+    monkeypatch.setenv("AWS_PROFILE", "profile-name-is-not-secret")
+
+    hint = credential_source_hint()
+    assert hint, "configured sources were not detected at all"
+    blob = str(hint)
+    for fragment in (access_key_id, secret, "DoNotLeak", "SessionValue",
+                     access_key_id[:8], secret[:6]):
+        assert fragment not in blob, f"credential material reached the status API: {fragment!r}"
+    # Only source NAMES are reported.
+    assert set(hint) <= {"environment", "AWS_PROFILE", "AWS_SHARED_CREDENTIALS_FILE",
+                         "container-credentials", "assumed-role",
+                         "~/.aws/credentials", "~/.aws/config"}
 
 
 def test_telemetry_from_a_real_invocation_carries_no_credentials():

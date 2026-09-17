@@ -704,9 +704,9 @@ class BedrockDiagnosisAgent:
             tool_calls=usage_summary.get("tool_calls") or {},
             tool_call_count=int(usage_summary.get("tool_call_count") or 0),
             turns=turns,
-            input_tokens=_int_or_none(usage.get("inputTokens")),
-            output_tokens=_int_or_none(usage.get("outputTokens")),
-            total_tokens=_int_or_none(usage.get("totalTokens")),
+            input_tokens=_token_count_or_none(usage.get("inputTokens")),
+            output_tokens=_token_count_or_none(usage.get("outputTokens")),
+            total_tokens=_token_count_or_none(usage.get("totalTokens")),
             bedrock_request_id=self._last_request_id,
             stop_reason=str(stop_reason) if stop_reason else None,
             strands_sdk_version=strands_sdk_version(),
@@ -911,3 +911,19 @@ def _int_or_none(value: Any) -> Optional[int]:
         return int(value) if value is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def _token_count_or_none(value: Any) -> Optional[int]:
+    """
+    A token count, or None when there is nothing to substantiate one.
+
+    Zero is treated as absent on purpose. Strands accumulates usage onto a
+    zero-initialised counter, so a response with no `usage` block and a response
+    reporting zero tokens are indistinguishable by the time we read them - and a
+    real Bedrock call that returned a structured diagnosis has necessarily billed
+    something. Recording 0 would therefore assert a measurement that was never
+    made. Requirement: record the count if the service provided one, otherwise
+    record null rather than fabricate a number.
+    """
+    count = _int_or_none(value)
+    return count if count is not None and count > 0 else None
