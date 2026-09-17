@@ -276,6 +276,11 @@ def _apply_agent_record(incident: Incident, source: Dict[str, Any]) -> None:
     telemetry = source.get("agent_telemetry") or {}
     incident.agent_mode = source.get("agent_mode") or telemetry.get("agent_mode")
     incident.agent_status = source.get("agent_status")
+    incident.diagnosis_outcome = source.get("diagnosis_outcome")
+    # Absent from an older record means unknown, and unknown must not be shown as
+    # true - so these default to False rather than None.
+    incident.bedrock_invoked = bool(source.get("bedrock_invoked"))
+    incident.used_llm = bool(source.get("used_llm"))
     incident.agent_note = source.get("agent_note")
     incident.model_id = telemetry.get("model_id")
     incident.aws_region = telemetry.get("aws_region")

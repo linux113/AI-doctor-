@@ -421,7 +421,13 @@ class DoctorRunner:
             # Which engine produced this diagnosis, so a rule-based answer can
             # never be read as a model answer.
             "agent_mode": agent_mode,
+            # The round trip, the decision, and the two booleans a reader needs to
+            # tell them apart. Propagated so the API and the dashboard can check a
+            # claim instead of trusting a label.
             "agent_status": agent_status,
+            "diagnosis_outcome": diagnosis.get("diagnosis_outcome"),
+            "bedrock_invoked": bool(diagnosis.get("bedrock_invoked")),
+            "used_llm": bool(diagnosis.get("used_llm")),
             "agent_note": diagnosis.get("agent_note"),
             "agent_telemetry": diagnosis.get("agent_telemetry"),
             "policy_decision": diagnosis.get("policy_decision"),

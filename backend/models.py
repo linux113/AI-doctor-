@@ -86,12 +86,26 @@ class Incident(BaseModel):
     # as a model conclusion. `agent_mode` is the answer to "who diagnosed this":
     #   bedrock        a real Amazon Bedrock call returned this diagnosis
     #   deterministic  the offline rule engine returned it
-    # `agent_status` adds how it ended: DIAGNOSED, REQUIRES_HUMAN,
-    # DETERMINISTIC, FALLBACK_DETERMINISTIC (bedrock was requested but
-    # unavailable) or FAILED. No credential material is stored here - only
-    # identifiers, counters and the class/detail of a failure.
+    # `agent_status` is the ROUND TRIP - what the model layer actually did:
+    #   BEDROCK_SUCCESS           a real Amazon Bedrock call returned a diagnosis
+    #   BEDROCK_SCHEMA_REFUSED    Bedrock answered, but not in the required shape
+    #   BEDROCK_UNAVAILABLE       Bedrock was asked and could not be used
+    #   FALLBACK_DETERMINISTIC    Bedrock failed and the offline engine answered
+    #   DETERMINISTIC             the offline rule engine was configured
+    # `diagnosis_outcome` is the DECISION - what the pipeline concluded:
+    # DIAGNOSED, REQUIRES_HUMAN or FAILED. Two fields, because one cannot answer
+    # both questions: a schema refusal reached Bedrock and produced no diagnosis,
+    # and a fallback produced a diagnosis without reaching Bedrock.
+    # `bedrock_invoked` is true only when a real request reached Bedrock and a
+    # response came back, and `used_llm` only when a model produced the validated
+    # diagnosis. The dashboard may not claim an AI diagnosis unless `used_llm` is
+    # true. No credential material is stored here - only identifiers, counters and
+    # the class/detail of a failure.
     agent_mode: Optional[str] = None
     agent_status: Optional[str] = None
+    diagnosis_outcome: Optional[str] = None
+    bedrock_invoked: Optional[bool] = None
+    used_llm: Optional[bool] = None
     agent_note: Optional[str] = None
     model_id: Optional[str] = None
     aws_region: Optional[str] = None

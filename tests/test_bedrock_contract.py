@@ -1,16 +1,27 @@
 """
-Bedrock contract tests (requirement 14).
+Bedrock CONTRACT tests - suite B of the three separated end-to-end tests.
+
+    A  tests/test_e2e_offline_deterministic.py   no AWS, no Ollama, runs in CI
+    B  tests/test_bedrock_contract.py  (THIS FILE) real Agent + real BedrockModel,
+                                                 only client.converse answered locally
+    C  tests/test_bedrock_live.py                a real, billable AWS request
 
 These verify that the REAL AWS Strands Agents SDK and the REAL boto3
 bedrock-runtime client are constructed correctly from configuration - correct
 model ID, correct region, bounded timeouts, exactly the intended tool set, and no
 credentials anywhere in the source or the configuration object.
 
-What they do NOT do is call Amazon Bedrock. That is tests/test_bedrock_live.py,
-which skips unless real credentials and model access exist. The distinction is
-deliberate and is why these tests use a fake HTTP transport for the parts that
-need a request payload: the SDK, the model class, the client and the request
-builder are all genuine, and only the socket is answered locally.
+What they do NOT do is call Amazon Bedrock. That is suite C, which skips when the
+operator has not opted in and FAILS - never skips - when the opt-in is set but a
+prerequisite such as credentials is missing. The distinction is deliberate and is
+why these tests use a fake transport for the parts that need a request payload:
+the SDK, the model class, the client and the request builder are all genuine, and
+only the socket is answered locally.
+
+Because a contract run and a live run must never be mistaken for one another, the
+final section pins what a faked transport canNOT produce: no service request ID
+and no billed token usage. `test_bedrock_live.py` asserts the same fields are
+present after a real round trip.
 """
 
 import re
@@ -22,6 +33,7 @@ import pytest
 from agent.config import (
     DEFAULT_MODEL_ID,
     DEFAULT_REGION,
+    MODE_BEDROCK,
     AgentConfig,
     AgentConfigurationError,
     boto3_version,
@@ -395,3 +407,53 @@ def test_telemetry_from_a_real_invocation_carries_no_credentials():
     blob = str(telemetry).lower()
     for marker in ("aws_secret", "secret_access_key", "session_token", "akia", "password"):
         assert marker not in blob, f"telemetry mentions {marker!r}"
+
+
+# =========================================================================
+# What a faked transport cannot produce - the boundary between B and C
+# =========================================================================
+
+
+def test_live_markers_are_absent_without_a_real_call():
+    """
+    Moved here from the live file, where it did not belong: this assertion is
+    ABOUT the fake transport, so it is a contract-level fact.
+
+    With a faked transport there is no service-assigned request ID and no billed
+    usage, which is exactly how a reader tells a contract result from a live one.
+    `test_bedrock_live.py` asserts the same fields ARE present after a genuine
+    round trip, so the two suites cannot be confused.
+
+    If this ever starts passing with a request ID present, something has begun
+    fabricating service metadata - the worst possible defect in this project.
+    """
+    transport = FakeBedrockTransport(emit_request_id_event=False)
+    result = make_transport_agent(bedrock_config(), transport).diagnose(
+        INCIDENT, DOWN_EVIDENCE, BASELINE, "inc-not-live"
+    )
+    assert result.telemetry.bedrock_request_id is None, (
+        "a request ID appeared without a real AWS call: service metadata is being fabricated"
+    )
+    assert result.telemetry.agent_mode == MODE_BEDROCK
+    # The round trip is attributed honestly even though nothing left the machine.
+    assert result.bedrock_invoked is True, "the fake transport did answer, so it was invoked"
+    assert result.used_llm is True
+    assert result.telemetry.failure_kind is None
+
+
+def test_a_contract_result_is_distinguishable_from_a_live_one():
+    """
+    The explicit statement of the B/C boundary, so a future reader cannot collapse
+    it: a contract result has real structure but no service-assigned identifiers.
+    """
+    transport = FakeBedrockTransport(emit_request_id_event=False)
+    result = make_transport_agent(bedrock_config(), transport).diagnose(
+        INCIDENT, DOWN_EVIDENCE, BASELINE, "inc-boundary"
+    )
+    record = result.as_dict()
+    telemetry = record["telemetry"]
+
+    assert record["agent_status"] == "BEDROCK_SUCCESS"
+    assert record["bedrock_invoked"] is True
+    assert telemetry["bedrock_request_id"] is None, "only a live call may carry one"
+    assert telemetry["model_id"], "the configured model is still reported"
