@@ -189,6 +189,7 @@ AI-doctor-/
 │   ├── doctor_runner.py            # Autonomous loop orchestrator
 │   ├── ollama_runtime.py           # Drives the REAL ollama binary; no stand-in server
 │   ├── pidfile.py                  # Verified PID handling (no confused deputy)
+│   ├── preflight.py                # Real-run CLI: preflight, bedrock-smoke-test, live-demo
 │   ├── procmatch.py                # Process identity matching (not substring mention)
 │   ├── redaction.py                # THE authoritative sanitisation path (sanitize_deep)
 │   ├── remediation.py              # Allowlisted safe remediation functions
@@ -345,9 +346,225 @@ Credentials are **never** set here. `bedrock` mode uses the standard boto3 chain
 source, in `.env`, in telemetry or in logs — `GET /api/system-status` reports only
 the *names* of the credential sources it found.
 
+## Preparing a real-world run
+
+`runner/preflight.py` is the product CLI for proving that a real run can actually
+happen — before any money is spent and before any claim is made. Three commands,
+in increasing order of cost and consequence:
+
+| Command | What it touches | Cost |
+|---|---|---|
+| `python -m runner.preflight` | local discovery, plus at most one STS `GetCallerIdentity` call | free |
+| `python -m runner.preflight bedrock-smoke-test` | one real Bedrock `Converse` request | **billable** |
+| `AI_DOCTOR_RUN_LIVE_BEDROCK=1 python -m runner.preflight live-demo` | Bedrock **and** the real local Ollama daemon | **billable** |
+
+Global flags: `--json` (machine-readable report) and `--no-network` (preflight
+then makes no network call at all, skipping the STS identity check). Exit code is
+`0` when the runtime is ready and `1` when anything is FAIL or BLOCKED.
+
+Neither real command runs unless `AI_DOCTOR_RUN_LIVE_BEDROCK=1` is exported, and
+both first run `tests/test_agent_redaction.py` and
+`tests/test_agent_prompt_injection.py` in a subprocess and refuse to continue if
+they do not pass. **Ordinary preflight never invokes a model** — it constructs
+the real client and asserts its endpoint, which requires no API call.
+
+### Prerequisites
+
+1. **Python ≥ 3.10** — strands-agents and boto3 both require it. Deterministic
+   mode still runs on 3.9.
+2. `pip install -r requirements-core.txt -r requirements-aws.txt` → verified
+   against **strands-agents 1.56.0**, **boto3 1.43.96**, **botocore 1.43.96**.
+   Preflight reports the versions it actually finds rather than trusting this line.
+3. **A real AWS account** with Amazon Bedrock model access enabled for the model
+   *and* the region you configure.
+4. **A real Ollama installation** for `live-demo`. Preflight and the smoke test do
+   not need one, but they report its true state either way.
+
+### AWS setup
+
+Credentials come from the standard boto3 provider chain only: environment
+variables, `~/.aws/credentials` / `~/.aws/config` shared profiles, an assumed IAM
+role, or IMDS on EC2. No credential value is read into this repository and none
+may be committed.
+
+| Permission | Why |
+|---|---|
+| `bedrock:InvokeModel` on the configured model | the `Converse` call. Use `bedrock:InvokeModel*` when the model is reached through a cross-region inference profile. |
+| `sts:GetCallerIdentity` | preflight's identity check, so credentials are proven before anything billable is attempted |
+
+```bash
+export AWS_REGION=us-east-1
+export AI_DOCTOR_AGENT_MODE=bedrock
+export AI_DOCTOR_AWS_REGION=us-east-1
+export AI_DOCTOR_BEDROCK_MODEL_ID=anthropic.claude-3-5-haiku-20241022-v1:0
+```
+
+The model must be enabled for the account **in that region**. A model available in
+`us-west-2` but not `us-east-1` produces a real `ResourceNotFoundException`,
+which is reported as `INVALID_MODEL` alongside the raw AWS code.
+
+### Ollama
+
+Install the real binary from <https://ollama.com/download>, then confirm it is
+genuinely present:
+
+```bash
+ollama --version          # preflight runs exactly this to verify identity
+ollama pull llama3.2      # a model must exist before the daemon can serve one
+```
+
+Discovery order is `$OLLAMA_EXECUTABLE` → `shutil.which("ollama")` → standard
+locations (`/usr/local/bin`, `/usr/bin`, `/opt/ollama/bin`, `~/.ollama/bin`). A
+file merely *named* `ollama` is rejected, because identity is verified by asking
+the binary for its version. When nothing is found the report says
+`OLLAMA: NOT_INSTALLED`: preflight starts nothing, fabricates no server and
+claims no recovery.
+
+### Environment variables for a real run
+
+| Variable | Needed for | Value |
+|---|---|---|
+| `AI_DOCTOR_AGENT_MODE` | smoke test, live demo | `bedrock` |
+| `AI_DOCTOR_AWS_REGION` | recommended | e.g. `us-east-1`; defaults to `us-east-1` in bedrock mode |
+| `AI_DOCTOR_BEDROCK_MODEL_ID` | recommended | defaults to `anthropic.claude-3-5-haiku-20241022-v1:0` |
+| `AI_DOCTOR_AGENT_FALLBACK` | optional | `fail` forbids any substitution — recommended for a demonstration, so a Bedrock failure cannot be masked by the offline rule engine |
+| AWS credentials | smoke test, live demo | via the provider chain; never stored here |
+| `AI_DOCTOR_RUN_LIVE_BEDROCK` | smoke test, live demo | `1` (also accepts `true`/`yes`/`on`) |
+| `OLLAMA_EXECUTABLE` | optional | absolute path, to override discovery |
+
+### 1. Preflight — free, and it never calls Bedrock
+
+```bash
+python -m runner.preflight
+python -m runner.preflight --json --no-network
+```
+
+It checks, in order: the installed packages and their real versions; the
+configuration and every relevant environment variable; whether the credential
+chain resolves anything at all; who the caller is (STS); whether the real Bedrock
+client constructs and points at `https://bedrock-runtime.<region>.amazonaws.com`;
+and the real Ollama state — executable identity, process identity, port 11434 and
+HTTP API health.
+
+Every line is `ok`, `warn`, `FAIL`, `skip` or `BLOCK`. The run ends with a verdict,
+the reasons for each failure, and the exact command to run next.
+
+### 2. Bedrock smoke test — one real, billable request
+
+```bash
+export AI_DOCTOR_RUN_LIVE_BEDROCK=1
+export AI_DOCTOR_AGENT_MODE=bedrock
+python -m runner.preflight bedrock-smoke-test
+```
+
+This builds the real `strands.Agent` with the real `strands.models.BedrockModel`,
+collects real evidence from this machine, and makes one real `Converse` request.
+The `DiagnosisResult` is the model's, parsed and schema-validated. Nothing is
+simulated: if the request fails, the actual AWS failure category is reported; if
+it succeeds, the request ID, latency and token counts come from the service
+response and from nowhere else.
+
+### 3. Live demo — the complete recovery loop
+
+```bash
+export AI_DOCTOR_RUN_LIVE_BEDROCK=1
+export AI_DOCTOR_AGENT_MODE=bedrock
+export AI_DOCTOR_AGENT_FALLBACK=fail        # refuse substitution during the demo
+python -m runner.preflight live-demo --create-failure
+```
+
+`live-demo` requires **both** a real AWS/Bedrock path and a real Ollama
+installation; with either missing it reports BLOCKED and stops. `--create-failure`
+generates a genuine outage first by stopping the running daemon through the
+existing allowlisted `stop_ollama` action — the same code path the product uses,
+not a test hook.
+
+Success is claimed only when all eleven criteria hold. They are evaluated in
+pipeline order, so the report names the **earliest** failed stage instead of a
+downstream consequence of it:
+
+| # | Criterion |
+|---|---|
+| 1 | a real Ollama process exists (the state before the run is not `OLLAMA_NOT_INSTALLED`) |
+| 2 | a real application failure was generated and an incident recorded |
+| 3 | diagnostic evidence was collected |
+| 4 | the real Strands Agent executed (`agent_mode=bedrock` and Bedrock was invoked) |
+| 5 | a real Bedrock request succeeded (`BEDROCK_SUCCESS` with a service request ID) |
+| 6 | a `DiagnosisResult` was produced from the model response |
+| 7 | the policy allowlist gate accepted the recommendation |
+| 8 | an allowlisted remediation executed and succeeded |
+| 9 | real Ollama verification succeeded (`OLLAMA_RUNNING`) |
+| 10 | the original request was retried |
+| 11 | the retry actually returned HTTP 200 |
+
+### What success looks like
+
+The report prints the proof fields, every one of them read from the real run:
+
+`agent_mode`, `agent_status`, `diagnosis_outcome`, `bedrock_invoked`, `used_llm`,
+`model_id`, `aws_region`, `bedrock_request_id`, `latency_ms`, `input_tokens`,
+`output_tokens`, `total_tokens`, `evidence_ids`, `recommended_action`,
+`policy_result`, `remediation_action`, `remediation_succeeded`,
+`verification_result`, `runtime_state_after`, `retry_result`,
+`final_http_status`, `incident_status`.
+
+A genuine success shows `agent_mode=bedrock`, `agent_status=BEDROCK_SUCCESS`, a
+non-null `bedrock_request_id` issued by the service, a measured `latency_ms`,
+`final_http_status=200`, and all eleven criteria `ok`.
+
+Token counts are **not** mandatory proof: they are recorded when the service
+returns them and are `null` when it does not. Every absent value prints as `None`
+— never as `0`, never as an estimate, never as a plausible-looking placeholder.
+
+### What failure looks like
+
+| In the report | Meaning | Fix |
+|---|---|---|
+| `aws:credentials` **BLOCK** | nothing found in the provider chain | export credentials or attach a role, then re-run preflight |
+| `aws:identity` FAIL `[NO_CREDENTIALS]` | the chain resolved nothing at call time | same as above |
+| FAIL `[ACCESS_DENIED]` | the principal lacks `bedrock:InvokeModel`, or model access is not enabled | grant the permission / enable access for that region |
+| FAIL `[INVALID_MODEL]` (`ResourceNotFoundException`) | no such model **in that region** | check `AI_DOCTOR_BEDROCK_MODEL_ID` and `AI_DOCTOR_AWS_REGION` |
+| FAIL `[SERVICE_UNAVAILABLE]` (`ModelNotReadyException`, `InternalServerException`, 5xx) | the service or model is not serving yet | retry once provisioning completes |
+| FAIL `[THROTTLED]` | rate limited | back off; `AI_DOCTOR_AGENT_MAX_MODEL_ATTEMPTS` controls retries |
+| FAIL `[TIMEOUT]` | exceeded `AI_DOCTOR_AGENT_TIMEOUT_SECONDS` | raise the timeout or reduce the evidence bundle |
+| FAIL `[NETWORK_UNREACHABLE]` (`EndpointConnectionError`, `SSLError`) | DNS, egress or TLS/proxy-certificate failure | check outbound access and the proxy CA bundle |
+| FAIL `[VALIDATION_ERROR]` | the request shape was rejected | check the model ID and region pairing |
+| FAIL `[SCHEMA_REFUSED]` | the model answered, but not in the required schema | reported honestly instead of guessed at |
+| FAIL `[SDK_MISSING]` | strands-agents or boto3 not installed | `pip install -r requirements-aws.txt` |
+| `ollama:state` **BLOCK** `NOT_INSTALLED` | no real binary found | install Ollama; nothing is started and nothing is substituted |
+| `redaction:tests` **BLOCK** | the security suites did not pass | no real request is made until they do |
+| `gate:opt-in` **BLOCK** | `AI_DOCTOR_RUN_LIVE_BEDROCK` is not set | deliberate — this is a billable call |
+
+The raw AWS code is always preserved next to the category (`failure_kind` plus
+`aws_error_code`), so nothing is collapsed into a generic `UNKNOWN_AWS_ERROR`
+unless it genuinely is unrecognised.
+
+### What is never printed
+
+One rule applies to every line of output: nothing leaves the process without
+passing through `runner.redaction.sanitize_deep`.
+
+* a secret access key or session token is **never read into a printable value** —
+  only its presence is noted;
+* an access key ID appears masked to its last four characters (`****Y123`), with a
+  fixed-width prefix so the mask cannot disclose the key's length;
+* account IDs and user IDs are masked the same way;
+* an ARN is reduced to the kind of principal it describes (`assumed-role`, `role`,
+  `user`, `federated-user`) — the ARN itself carries the account ID and the role
+  name, so it is never reproduced;
+* authorization headers, passwords, API keys, bearer tokens, and credentials
+  nested inside exception text are redacted;
+* the raw prompt is never logged.
+
+`tests/test_preflight.py` asserts each of these against real command runs, and
+asserts that an ordinary preflight attempts no AWS API call at all by patching
+`botocore.client.BaseClient._make_api_call` — the single funnel every AWS
+operation passes through — so "no Bedrock call was made" is an assertion, not a
+claim.
+
 ## Running Verification & Tests
 
-Run the full automated test suite (**556 passed, 16 skipped**):
+Run the full automated test suite (**736 passed, 17 skipped**):
 
 ```bash
 pytest tests/ -v
@@ -362,10 +579,13 @@ pytest tests/ -v --ignore=tests/test_ai_doctor.py
 Most of these tests were added by the technical audit and pin each fix in
 [SECURITY.md](SECURITY.md); they fail if a guardrail is later relaxed.
 
-The 16 skips are explicit, never substituted: 13 need the real `ollama` binary
-and 3 make a real, billable Bedrock call and require
-`AI_DOCTOR_RUN_LIVE_BEDROCK=1` plus credentials. See
-`tests/test_bedrock_live.py` for the exact command.
+The 17 skips are explicit, never substituted: 13 need the real `ollama` binary,
+3 make a real, billable Bedrock call and require `AI_DOCTOR_RUN_LIVE_BEDROCK=1`
+plus credentials, and 1 is the quarantined optional medical-triage component,
+which skips at module level when `deepeval`/`deepteam` are not installed. See
+`tests/test_bedrock_live.py` for the exact command, and
+[`runner/preflight.py`](#preparing-a-real-world-run) for the supported way to make
+a real Bedrock call.
 
 Execute a deterministic end-to-end recovery test via CLI:
 

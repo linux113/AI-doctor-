@@ -114,6 +114,13 @@ _BOTOCORE_KINDS = {
     "ReadTimeoutError": FAILURE_TIMEOUT,
     "ConnectionClosedError": FAILURE_NETWORK,
     "HTTPClientError": FAILURE_NETWORK,
+    # botocore.exceptions.SSLError is its own class (MRO: SSLError ->
+    # ConnectionError -> BotoCoreError), and the lookup above matches on the exact
+    # class name, so without this entry a TLS/proxy-certificate failure - one of
+    # the most common ways a real Bedrock call fails behind a corporate proxy -
+    # was reported as UNKNOWN_AWS_ERROR. It is a network failure, and the frozen
+    # taxonomy already has a kind for that.
+    "SSLError": FAILURE_NETWORK,
     "UnknownServiceError": FAILURE_NETWORK,
 }
 

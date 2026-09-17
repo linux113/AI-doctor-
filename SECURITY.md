@@ -15,7 +15,7 @@ Three invariants, in order of importance:
 
 | Invariant | Mechanism | Location |
 |---|---|---|
-| No arbitrary code execution | No `eval`, `exec`, `compile`, `os.system`, `__import__`, or `shell=True` anywhere in the codebase. The single `subprocess.Popen` uses a fixed argv list built from `sys.executable`. | `runner/remediation.py` |
+| No arbitrary code execution | No `eval`, `exec`, `compile`, `os.system`, `__import__`, or `shell=True` anywhere in the codebase. Every process is spawned from a fixed argv list, never a shell string: the single `subprocess.Popen` (daemon start) and two `subprocess.run` calls (the `ollama --version` identity probe, and the preflight redaction gate, whose argv is built from `sys.executable`). | `runner/ollama_runtime.py`, `runner/preflight.py` |
 | Diagnostics cannot mutate state | The diagnostic registry refuses to register any tool with `read_only=False`. | `runner/tool_registry.py` |
 | Remediation is allowlisted | A `frozenset` allowlist; `register()` raises `PermissionError` for anything outside it, and `execute()` blocks and audit-logs unlisted actions. | `runner/remediation_registry.py` |
 
@@ -463,37 +463,43 @@ injects it server-side into the proxy so the browser never sees it.
 ## 5. Test summary
 
 ```
-556 passed, 0 failed, 16 skipped, 5 warnings        (572 collected)
-549 passed, 0 failed, 16 skipped, 1 warning         (product only: --ignore=tests/test_ai_doctor.py)
+736 passed, 0 failed, 17 skipped, 1 warning         (753 items collected)
+736 passed, 0 failed, 16 skipped, 1 warning         (product only: --ignore=tests/test_ai_doctor.py)
 ```
 
-The 16 skips are two distinct, explicit integration categories — never a
-substitute:
+The 17 skips are three distinct, explicit categories — never a substitute:
 
 * **13** need the real `ollama` binary and daemon. No stand-in server is started
   to make them pass.
 * **3** make a real, billable Amazon Bedrock call and require
   `AI_DOCTOR_RUN_LIVE_BEDROCK=1` plus working credentials (§7.7).
+* **1** is the quarantined medical component (§6.7), which skips at module level
+  when `deepeval`/`deepteam` are not installed. Its 7 tests run wherever the
+  optional extra is present.
 
-All 5 warnings are third-party deprecations (starlette/anyio, and four from
-`deepteam` imported by the quarantined medical component) — none originate in
-this repository's code.
+The single warning is a third-party deprecation (starlette/anyio). The four
+`deepteam` warnings appear only where that optional extra is installed. None
+originate in this repository's code.
 
 | Suite | Tests | Scope |
 |---|---|---|
+| `test_preflight.py` | 96 | **§8** real-run CLI: masking, opt-in gate, proof that no Bedrock call is made, the eleven success criteria |
 | `test_agent_tools.py` | 93 | **§7** tool boundary: registered set, no dangerous parameter, budget |
 | `test_security_hardening.py` | 77 | F1–F13, PID trust, registry verdicts, CORS, auth, redaction |
+| `test_agent_prompt_injection.py` | 66 | **§7** adversarial evidence, fence escape, persuaded-model refusals |
+| `test_agent_policy.py` | 62 | **§7** allowlist gate, forbidden vocabulary, hallucinated evidence |
 | `test_agent_schemas.py` | 58 | **§7** `DiagnosisResult` strictness, telemetry field set |
-| `test_agent_prompt_injection.py` | 58 | **§7** adversarial evidence, fence escape, persuaded-model refusals |
-| `test_agent_policy.py` | 58 | **§7** allowlist gate, forbidden vocabulary, hallucinated evidence |
-| `test_bedrock_contract.py` | 47 | **§7** real SDK/boto3 construction, request payload, no credentials |
-| `test_agent_modes.py` | 43 | **§7** mode labelling, honest AWS failure, no silent fallback |
+| `test_agent_modes.py` | 57 | **§7** mode labelling, honest AWS failure, no silent fallback |
+| `test_bedrock_contract.py` | 53 | **§7** real SDK/boto3 construction, request payload, no credentials |
 | `test_agent_evidence.py` | 25 | **§7** evidence caps, truncation disclosure, hallucination check |
-| `test_agent_redaction.py` | 10 | **§7** nothing secret reaches the Bedrock request |
-| `test_bedrock_live.py` | 6 | **§7** real Bedrock call (3 skip) + negative controls |
 | `test_defect_regressions.py` | 24 | **D1, D2, D3** and the Phase-6 audit trail |
+| `test_agent_redaction.py` | 19 | **§7** nothing secret reaches the Bedrock request |
+| `test_e2e_offline_deterministic.py` | 18 | **§7** the whole loop offline, honestly labelled as deterministic |
 | `test_ollama_integration.py` | 17 | Runtime matrix **A–F** (§6) |
+| `test_dashboard_honesty.py` | 16 | **§7** the UI cannot overstate what actually happened |
+| `test_timeline_stage_vocabulary.py` | 15 | **§7** neutral stage codes survive the API boundary |
 | `test_process_identity.py` | 13 | F3, incl. a live decoy shell |
+| `test_bedrock_live.py` | 7 | **§7** real Bedrock call (3 skip) + negative controls |
 | `test_retry.py` | 6 | Replay, SSRF guard, error classification |
 | `test_remediation_allowlist.py` | 6 | Allowlist enforcement and audit trail |
 | `test_ollama_recovery.py` | 6 | Recovery lifecycle + honest failure when absent |
@@ -914,3 +920,126 @@ is why they surfaced here.
 * No cloud resource is deployed. The Lambda/API Gateway shape described in the
   README is a next phase; the agent layer is stateless and environment-driven so
   it can move there unchanged.
+
+---
+
+## 8. Phase 4 — the real-run preflight boundary
+
+Phase 4 added no product behaviour. It added one thing: a way to prove on a real
+machine that the integration described in §7 actually runs, and a way to be told
+precisely why it does not.
+
+`runner/preflight.py` is the product's CLI. `ai_doctor/cli.py` is **not** it — that
+file belongs to the quarantined medical prototype (§6.7) and imports nothing from
+the product. The recovery agent had no CLI at all before this phase, so preflight
+is its first entry point rather than a second application.
+
+### 8.1 What each command is allowed to reach
+
+| Command | Reach | Gate |
+|---|---|---|
+| `preflight` | local discovery, plus at most one STS `GetCallerIdentity` | none — it is free and makes no model call |
+| `bedrock-smoke-test` | one real Bedrock `Converse` request | `AI_DOCTOR_RUN_LIVE_BEDROCK=1`, then the redaction suites must pass |
+| `live-demo` | Bedrock **and** the real Ollama daemon, full recovery loop | both of the above, plus a real Ollama installation |
+
+The security model in §1 is unchanged. Preflight has no tools, cannot remediate,
+and gives the model nothing. The only state it can change is through an action the
+existing allowlist already permits: `--create-failure` stops a running daemon via
+`stop_ollama`, the same code path the product uses, not a test hook.
+
+Ordering is the control. Opt-in → redaction gate → mode → credentials → identity →
+client construction → Ollama state → the request. Any step can stop the run, and
+the step that stopped it is the one reported.
+
+### 8.2 Nothing is fabricated
+
+Three rules the code enforces and `tests/test_preflight.py` asserts:
+
+1. **An ordinary preflight makes no AWS API call.** Proven by patching
+   `botocore.client.BaseClient._make_api_call` — the single funnel every AWS
+   operation passes through — and asserting it was never entered. Constructing a
+   client is not calling a service, and the report says so in those words:
+   `CONSTRUCTED (no Bedrock call was made)`.
+2. **A client that is not the real regional Bedrock client is refused.** The
+   endpoint host must be `https://bedrock-runtime.<region>.amazonaws.com` and the
+   client must be a real `botocore.client`. A stub fails this check instead of
+   passing as real.
+3. **Absent values are `null`, never a plausible number.** `bedrock_request_id`,
+   `latency_ms` and the token counts come from the service response or stay
+   `None`. Token counts are not mandatory proof: a run that returns none can still
+   satisfy the other ten criteria.
+
+The eleven success criteria are evaluated in pipeline order, so the report names
+the *earliest* failed stage rather than a downstream consequence of it. The
+deterministic fallback cannot satisfy criterion 4 (`agent_mode == "bedrock"` with
+Bedrock actually invoked) or criterion 5 (`BEDROCK_SUCCESS` with a real request
+ID), so a fallback run can never be presented as a live demonstration. That is
+§7.8's honesty rule, now enforced at the reporting layer as well.
+
+### 8.3 Secret handling
+
+One path out: every rendered line passes through `runner.redaction.sanitize_deep`
+(§6.3). On top of that:
+
+| Value | Treatment |
+|---|---|
+| secret access key, session token | never read into a printable value; only presence is noted |
+| access key ID | masked to the last four characters behind a fixed-width `****` prefix, so the mask cannot disclose the key's length |
+| account ID, user ID | masked the same way |
+| ARN | reduced to the principal kind (`assumed-role`, `role`, `user`, `federated-user`). The ARN carries the account ID and the role name, so it is never reproduced. |
+| raw prompt | never logged |
+
+The redaction gate is not advisory. `bedrock-smoke-test` and `live-demo` run
+`tests/test_agent_redaction.py` and `tests/test_agent_prompt_injection.py` in a
+subprocess — fixed argv, no shell — and stop with `BLOCKED` if they fail, if the
+files are missing, or if they hang past 600s.
+
+### 8.4 Failure categories are not collapsed
+
+Preflight reports a `failure_kind` from the frozen 13-kind taxonomy in §7, with the
+raw `aws_error_code` preserved beside it. No new kind was added for this phase; the
+existing taxonomy already distinguishes every category an operator can act on:
+
+| Real error | Reported kind |
+|---|---|
+| nothing in the credential chain | `NO_CREDENTIALS` |
+| access key without a secret key | `PARTIAL_CREDENTIALS` |
+| `AccessDeniedException`, `InvalidClientTokenId`, `ExpiredToken`, signature failures | `ACCESS_DENIED` |
+| `ResourceNotFoundException` | `INVALID_MODEL` — no such model in that region |
+| `ValidationException`, `ConflictException` | `VALIDATION_ERROR` |
+| `ThrottlingException`, `ServiceQuotaExceededException`, `SlowDown` | `THROTTLED` |
+| `ModelTimeoutException`, connect/read timeouts | `TIMEOUT` |
+| `EndpointConnectionError`, `SSLError`, `ConnectionClosedError` | `NETWORK_UNREACHABLE` |
+| `ModelNotReadyException`, `ModelErrorException`, `InternalServerException`, 5xx | `SERVICE_UNAVAILABLE` |
+| `ContextWindowOverflowException` | `CONTEXT_OVERFLOW` |
+| the model answered outside the required schema | `SCHEMA_REFUSED` |
+| strands-agents or boto3 not installed | `SDK_MISSING` |
+| genuinely unrecognised | `UNKNOWN_AWS_ERROR`, with the raw code preserved |
+
+An absent Ollama is `OLLAMA_NOT_INSTALLED`, which is a different finding from an
+outage (`OLLAMA_STOPPED`) or a daemon that answers nothing (`OLLAMA_UNHEALTHY`).
+In all three states preflight starts nothing, fabricates no server and claims no
+recovery.
+
+### 8.5 Defects found and fixed while building this phase
+
+| # | Defect | Fix |
+|---|---|---|
+| P9 | `botocore.exceptions.SSLError` was classified `UNKNOWN_AWS_ERROR`. `_BOTOCORE_KINDS` matches on the exact class name and `SSLError` is its own class (`SSLError → ConnectionError → BotoCoreError`), so one of the most common ways a real Bedrock call fails — a corporate proxy with its own CA — was reported in the one category an operator cannot act on. | Mapped `SSLError` onto the existing `NETWORK_UNREACHABLE` kind. No new kind, no taxonomy change. |
+| P10 | `check_bedrock_client` reached `client.meta.service_model` through a chained `getattr` whose intermediate could be `None`, so a client missing `meta` raised `AttributeError` *out of* the preflight instead of reporting a failure. | Every attribute step is defensive now; a malformed client yields a `FAILED` check naming the offending endpoint. |
+| P11 | `--json` and `--no-network` were accepted only *after* the subcommand name, and argparse let a subparser's default silently overwrite a value already set on the top-level parser. | Defined on both parsers, with `argparse.SUPPRESS` defaults on the subparsers so either position works. |
+| P12 | The live-demo path probed the Ollama API through `DoctorRunner.ollama_runtime`, an attribute that does not exist — `DoctorRunner` holds registries, not the runtime object. | Uses the same `get_runtime()` singleton the rest of the product uses. |
+
+### 8.6 Remaining limitations
+
+* **Still no live Bedrock call from this environment.** There are no AWS
+  credentials and `bedrock-runtime` is unroutable from here; an STS attempt made
+  while building this phase failed with a real `SSLError`, now correctly reported
+  as `NETWORK_UNREACHABLE`. Preflight itself is verified end to end. The smoke test
+  and the live demo are verified *up to* their gates and are `BLOCKED` beyond them.
+  A live result has to be produced on a machine with credentials and a real Ollama
+  installation, and it has to show a `bedrock_request_id`.
+* Preflight is read-only by design. It can tell you the runtime is ready; it cannot
+  make it ready, and it does not try.
+* `--json` mirrors the human report exactly. Neither contains information the other
+  lacks, and both are redacted through the same path.
