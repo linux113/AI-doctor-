@@ -129,31 +129,35 @@ AI-doctor-/
 │   ├── aws_architecture.md         # AWS native service mapping & security specs
 │   └── dynamodb_schema.json        # DynamoDB table and GSI definition
 ├── runner/
-│   ├── diagnostics.py              # Read-only tools & credential scrubber
+│   ├── diagnostics.py              # Read-only tools (re-exports the scrubber)
 │   ├── diagnosis.py                # Deterministic root-cause engine (single source of truth)
 │   ├── doctor_runner.py            # Autonomous loop orchestrator
-│   ├── ollama_service.py           # Local Ollama HTTP daemon (:11434)
+│   ├── ollama_runtime.py           # Drives the REAL ollama binary; no stand-in server
 │   ├── pidfile.py                  # Verified PID handling (no confused deputy)
 │   ├── procmatch.py                # Process identity matching (not substring mention)
+│   ├── redaction.py                # THE authoritative sanitisation path (sanitize_deep)
 │   ├── remediation.py              # Allowlisted safe remediation functions
-│   ├── remediation_registry.py     # Strict security allowlist & audit log
+│   ├── remediation_registry.py     # Strict security allowlist & incident-scoped audit log
 │   ├── security.py                 # SSRF guard for retry destinations
 │   ├── timeutil.py                 # Timezone-aware, fixed-width UTC timestamps
 │   └── tool_registry.py            # Diagnostic tool registry
-├── ai_doctor/                      # OPTIONAL, separate component: medical-triage
-│   │                               # assistant + DeepTeam red teaming (see below)
-└── tests/
-    ├── test_security_hardening.py    # 72 tests: SSRF, PID trust, registry, confidence, CORS, auth, redaction
-    ├── test_process_identity.py      # 12 tests: process matching incl. a live decoy shell
-    ├── test_api_endpoints.py         # Full recovery lifecycle integration tests
-    ├── test_failure_detection.py     # Intentional failure & incident generation
-    ├── test_ollama_detection.py      # Service probe unit tests
-    ├── test_ollama_recovery.py       # Daemon recovery lifecycle
-    ├── test_port_detection.py        # TCP port socket probe tests
-    ├── test_remediation_allowlist.py # Security boundary & block verification
-    ├── test_retry.py                 # Request replay unit tests
-    ├── test_verification.py          # Post-remediation health verification
-    └── test_ai_doctor.py             # 7 tests for the optional medical component (skips w/o deepeval)
+├── ai_doctor/                      # QUARANTINED medical-triage prototype (see
+│   │                               # ai_doctor/QUARANTINE.md) - not imported by the product
+└── tests/                            # 173 collected: 160 pass, 13 skip without real Ollama
+    ├── conftest.py                   # Real-Ollama detection + explicit integration skips
+    ├── test_security_hardening.py    # 76: SSRF, PID trust, registry, confidence, CORS, auth, redaction
+    ├── test_defect_regressions.py    # 24: D1 false-positive recovery, D2 secret leak, D3 error class
+    ├── test_ollama_integration.py    # 17: runtime matrix A-F (installed/running/stopped/absent/failed)
+    ├── test_process_identity.py      # 13: process matching incl. a live decoy shell
+    ├── test_ai_doctor.py             #  7: QUARANTINED medical component - not product coverage
+    ├── test_retry.py                 #  6: request replay unit tests
+    ├── test_remediation_allowlist.py #  6: security boundary & block verification
+    ├── test_ollama_recovery.py       #  6: daemon recovery lifecycle
+    ├── test_ollama_detection.py      #  6: service probe unit tests
+    ├── test_verification.py          #  4: post-remediation health verification
+    ├── test_port_detection.py        #  4: TCP port socket probe tests
+    ├── test_api_endpoints.py         #  3: full recovery lifecycle integration tests
+    └── test_failure_detection.py     #  1: intentional failure & incident generation
 ```
 
 ### Two components in this repository
@@ -163,11 +167,12 @@ This repository contains two distinct pieces of work that share a name:
 1. **The autonomous recovery agent** — `runner/`, `backend/`, `frontend/`, `agent/`.
    This is what the rest of this README describes. Install with
    `requirements-core.txt`; no LLM or AWS credentials required.
-2. **An optional medical-triage assistant** — `ai_doctor/`, `deepteam_config.yaml`,
-   `example_redteam.py`. This is a DeepTeam red-teaming target and is entirely
-   separate from the recovery loop. Install with `requirements.txt` (or
-   `pip install -e ".[redteam]"`). Its tests **skip** cleanly when `deepeval` is
-   absent rather than aborting collection of the recovery agent's suite.
+2. **A quarantined medical-triage prototype** — `ai_doctor/`, `deepteam_config.yaml`,
+   `example_redteam.py`. It is **not** part of this product: nothing in `backend/`,
+   `runner/`, `agent/` or `frontend/` imports it, and it is excluded from
+   `requirements-core.txt`. Read `ai_doctor/QUARANTINE.md` before touching it. Its
+   7 tests validate that prototype only and are **not** security coverage for the
+   recovery agent — `npm run test:core` excludes them for exactly that reason.
 
 ---
 
@@ -177,7 +182,7 @@ This repository contains two distinct pieces of work that share a name:
 |---|---|---|
 | **AI Doctor Dashboard** | `3000` | Next.js + Framer Motion developer UI (bound to `0.0.0.0:3000`) |
 | **Backend REST API** | `8000` | FastAPI application (`/health`, `/api/incidents`, `/api/heal`, `/api/diagnose`) |
-| **Ollama Daemon** | `11434` | Local Ollama AI runtime HTTP daemon with `/api/tags` and `/api/generate` |
+| **Ollama Daemon** | `11434` | The real upstream [Ollama](https://ollama.com) runtime. **Not provided by this repo** — install it separately. When it is absent the agent reports `OLLAMA_NOT_INSTALLED` and substitutes nothing. |
 
 ---
 
@@ -201,12 +206,36 @@ cd frontend && npm install
 ## Running the Stack
 
 ```bash
-python -m runner.ollama_service                                   # :11434
+ollama serve                                                      # :11434 (real upstream binary)
 uvicorn backend.main:app --host 0.0.0.0 --port 8000               # :8000
 cd frontend && npm run dev                                        # :3000
 ```
 
 Or via the root `package.json` scripts: `npm run ollama`, `npm run backend`, `npm run dashboard`.
+
+### Ollama is a real external dependency
+
+This repository previously shipped a ~180-line Python HTTP server
+(`runner/ollama_service.py`) that answered on port 11434 and was documented as
+"the local Ollama daemon". **It has been deleted.** A Python `http.server` is not
+Ollama, and its presence let the demo report recoveries that had never happened —
+including a "successful" start whose child process was already dead.
+
+The agent now discovers and drives the real binary via `runner/ollama_runtime.py`
+and reports `OLLAMA_NOT_INSTALLED` when it is absent:
+
+- discovery order: `$OLLAMA_EXECUTABLE` → `shutil.which("ollama")` → standard
+  Linux locations (`/usr/local/bin`, `/usr/bin`, `/opt/ollama/bin`,
+  `~/.ollama/bin`) — no hardcoded single path;
+- **identity is verified by running `ollama --version`**, so a file merely named
+  `ollama` is rejected;
+- `start()` reports success only when the spawned child is alive, the listening
+  socket belongs to that child or a descendant, the port is open **and** the HTTP
+  API answers. A foreign listener on the port is identified and rejected, never
+  adopted.
+
+Without Ollama the 13 integration tests skip with an explicit reason. No
+substitute server is started to make them pass.
 
 ## Configuration
 

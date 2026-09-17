@@ -133,7 +133,7 @@ export default function AIDoctorDashboard() {
       const res = await fetch('/api/demo/query', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt: 'Analyze patient emergency vitals' }),
+        body: JSON.stringify({ prompt: 'Analyze service health metrics' }),
       });
       const data = await res.json();
       if (res.ok) {

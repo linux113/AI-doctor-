@@ -46,7 +46,22 @@ def test_allowlist_records_audit_trail_for_blocks():
     assert recent_blocked[-1]["allowed"] is False
 
 
-def test_authorized_action_executes_safely():
+def test_authorized_action_is_not_blocked_by_the_allowlist():
+    """
+    An allowlisted action must reach the callable - it is never reported as
+    BLOCKED. Whether it *succeeds* depends on the real runtime, which the next
+    test covers; here only the allowlist decision is asserted, so this runs on
+    any machine.
+    """
+    result = remediation_registry.execute("start_ollama")
+    assert result["action"] == "start_ollama"
+    assert not result.get("blocked", False)
+    assert "SECURITY ALERT" not in str(result.get("error", ""))
+
+
+def test_authorized_action_executes_safely(requires_real_ollama):
+    """INTEGRATION - requires the real Ollama binary."""
     result = remediation_registry.execute("start_ollama")
     assert result["success"] is True
     assert result["action"] == "start_ollama"
+    assert result["result"]["state"] == "OLLAMA_RUNNING"

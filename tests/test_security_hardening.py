@@ -123,12 +123,24 @@ def test_registry_records_failed_status_in_audit_log():
 
 
 def test_registry_treats_actions_without_success_key_as_successful():
-    """stop_ollama reports no "success" key; a clean return must stay a success."""
-    stop_ollama()
-    out = remediation_registry.execute("stop_ollama")
-    assert out["success"] is True
-    assert out["result"]["action"] == "stop_ollama"
-    start_ollama()
+    """
+    An action that returns cleanly without a "success" key is a success.
+
+    The callable is replaced rather than the real `stop_ollama` being invoked, so
+    this asserts the registry's verdict logic without touching any process and
+    without depending on a real Ollama installation.
+    """
+    original = remediation_registry._actions["stop_ollama"]["fn"]
+    remediation_registry._actions["stop_ollama"]["fn"] = lambda: {
+        "action": "stop_ollama",
+        "terminated_pids": [],
+    }
+    try:
+        out = remediation_registry.execute("stop_ollama")
+        assert out["success"] is True
+        assert out["result"]["action"] == "stop_ollama"
+    finally:
+        remediation_registry._actions["stop_ollama"]["fn"] = original
 
 
 def test_fix_failure_is_attributed_to_the_fix_stage():
@@ -179,32 +191,48 @@ def test_timeline_separates_fix_failure_from_verification():
 # =========================================================================
 
 
-def test_retry_remediation_replays_the_captured_request():
+def test_retry_remediation_passes_the_captured_url_to_the_action(local_http_server):
     """
     When the diagnosis is retry_request, the runner used to invoke the action
     with no arguments. `url` is required, so it raised TypeError and every
     "infrastructure looks healthy" incident failed at the FIX stage.
+
+    The captured request is replayed against a generic local listener: the defect
+    is about argument passing, which has no Ollama dependency. The full
+    RESOLVED-path version of this test is in tests/test_ollama_integration.py.
     """
-    start_ollama()
-    out = doctor_runner.heal_incident({
-        "incident_id": "inc-retry",
-        "error": "unexplained application error",
-        "request_context": {
-            "url": "http://127.0.0.1:11434/api/tags",
-            "method": "GET",
-        },
-    })
+    _host, _port, url = local_http_server
+    calls = []
+    original = remediation_registry._actions["retry_request"]["fn"]
 
-    assert out["action_taken"] == "retry_request"
-    assert out["status"] == "RESOLVED"
-    assert out["failed_stage"] is None
-    assert out["retry_result"]["success"] is True
-    assert out["retry_result"]["status_code"] == 200
+    def spy(**kwargs):
+        calls.append(kwargs)
+        return original(**kwargs)
+
+    remediation_registry._actions["retry_request"]["fn"] = spy
+    try:
+        out = doctor_runner.run_remediation_and_verify(
+            "retry_request",
+            failed_request_context={"url": url, "method": "GET"},
+            incident_id="inc-retry-args",
+        )
+        assert len(calls) == 1, f"expected exactly one replay, got {calls}"
+        assert calls[0]["url"] == url
+        assert calls[0]["method"] == "GET"
+        # A TypeError from a missing `url` would surface as a FIX-stage failure.
+        assert out.get("stage") != "FIX", out.get("error")
+    finally:
+        remediation_registry._actions["retry_request"]["fn"] = original
 
 
-def test_retry_remediation_does_not_replay_twice():
-    """The remediation IS the replay; the separate RETRY step must not re-issue it."""
-    start_ollama()
+def test_retry_remediation_does_not_replay_twice(local_http_server):
+    """
+    The remediation IS the replay; the separate RETRY step must not re-issue it.
+
+    A double replay of a non-idempotent POST is a real fault, so the call count
+    is asserted rather than the recovery outcome.
+    """
+    _host, _port, url = local_http_server
     calls = []
     original = remediation_registry._actions["retry_request"]["fn"]
 
@@ -214,29 +242,53 @@ def test_retry_remediation_does_not_replay_twice():
 
     remediation_registry._actions["retry_request"]["fn"] = spy
     try:
-        doctor_runner.heal_incident({
-            "incident_id": "inc-once",
-            "error": "unexplained",
-            "request_context": {"url": "http://127.0.0.1:11434/api/tags", "method": "GET"},
-        })
+        doctor_runner.run_remediation_and_verify(
+            "retry_request",
+            failed_request_context={"url": url, "method": "POST", "payload": {"prompt": "x"}},
+            incident_id="inc-once",
+        )
         assert len(calls) == 1, f"expected exactly one replay, got {calls}"
     finally:
         remediation_registry._actions["retry_request"]["fn"] = original
 
 
 def test_retry_remediation_without_context_fails_cleanly():
-    stop_ollama()
-    out = doctor_runner.heal_incident({"incident_id": "inc-nocontext", "error": "boom"})
-    # Infrastructure is down, so this routes to start_ollama and recovers.
-    assert out["status"] == "RESOLVED"
-    start_ollama()
+    """
+    retry_request with no captured request must fail at the FIX stage with a
+    clear reason, instead of raising TypeError inside the action.
 
-    # Now force the healthy-infrastructure branch with no request context.
-    out = doctor_runner.heal_incident({"incident_id": "inc-nocontext2", "error": "boom"})
-    assert out["action_taken"] == "retry_request"
-    assert out["status"] == "FAILED"
-    assert out["failed_stage"] == "FIX"
+    Called directly so the assertion does not depend on which hypothesis the
+    evidence happens to select on this machine.
+    """
+    out = doctor_runner.run_remediation_and_verify(
+        "retry_request", failed_request_context=None, incident_id="inc-nocontext"
+    )
+    assert out["success"] is False
+    assert out["stage"] == "FIX"
+    assert out["action"] == "retry_request"
     assert "no request context" in out["error"]
+
+
+def test_heal_incident_without_context_routes_through_the_allowlist(ollama_state):
+    """
+    heal_incident must still produce a complete, honest timeline when there is no
+    request context to replay - whatever the runtime state on this machine.
+    """
+    from runner.ollama_runtime import OLLAMA_NOT_INSTALLED
+
+    out = doctor_runner.heal_incident({"incident_id": "inc-nocontext2", "error": "boom"})
+    assert out["incident_id"] == "inc-nocontext2"
+    stages = [t["stage"] for t in out["timeline"]]
+    assert stages[0] == "DETECTED"
+    assert "ROOT CAUSE FOUND" in stages
+    assert stages[-1] in ("RESOLVED", "FAILED")
+    if ollama_state == OLLAMA_NOT_INSTALLED:
+        # No allowlisted action can install a runtime, so this must not resolve.
+        assert out["status"] == "FAILED"
+        assert out["runtime_state"] == OLLAMA_NOT_INSTALLED
+        assert out["requires_human"] is True
+    assert out["audit_log"], "every remediation attempt must leave an audit trail"
+    assert all(e["incident_id"] == "inc-nocontext2" for e in out["audit_log"])
 
 
 def test_heal_incident_returns_the_incident_id():
@@ -432,38 +484,85 @@ def test_refuses_a_malformed_pid_file(tmp_path):
     assert reason is not None
 
 
-def test_stop_ollama_refuses_a_tampered_pid_file(tmp_path, monkeypatch):
-    import runner.pidfile as pf
-    import runner.remediation as rm
+def test_stop_ollama_refuses_a_tampered_pid_file(tmp_path):
+    """
+    The PID file lives in world-writable /tmp, so its contents are untrusted.
+
+    A PID whose live process is not the Ollama runtime must be refused and
+    reported, never signalled. The runtime's process discovery and port probe are
+    stubbed out so this unit test cannot signal a real daemon that happens to be
+    running on the developer's machine.
+    """
+    from runner.ollama_runtime import OllamaRuntime
 
     victim = os.getppid()
     pid_file = tmp_path / "ollama.pid"
     pid_file.write_text(str(victim))
     os.chmod(pid_file, 0o666)
 
-    monkeypatch.setattr(pf, "DEFAULT_PID_FILE", str(pid_file))
-    monkeypatch.setattr(rm, "OLLAMA_PID_FILE", str(pid_file))
+    runtime = OllamaRuntime(pid_file=str(pid_file))
+    runtime._resolution_attempted = True
+    runtime._resolved_executable = None  # deterministic "not installed"
+    runtime.find_ollama_processes = lambda: []
+    runtime.port_is_open = lambda timeout=1.0: False
 
-    out = rm.stop_ollama()
+    out = runtime.stop().as_dict()
 
     assert victim not in out["terminated_pids"]
     assert out["refused_pids"], "a tampered PID must be reported as refused"
-    assert psutil.pid_exists(victim)
-    start_ollama()
+    assert str(victim) in out["refused_pids"][0]["reason"]
+    assert psutil.pid_exists(victim), "the tampered PID target was signalled"
 
 
-def test_accepts_the_real_service_pid_file():
-    start_ollama()
-    try:
-        import runner.pidfile as pf
+def test_stop_ollama_refuses_a_malformed_pid_file(tmp_path):
+    from runner.ollama_runtime import OllamaRuntime
 
-        pid, reason = read_trusted_pid(pf.DEFAULT_PID_FILE)
-        assert reason is None
-        assert pid is not None
-        trusted, _ = is_trusted_ollama_pid(pid)
-        assert trusted is True
-    finally:
-        stop_ollama()
+    pid_file = tmp_path / "ollama.pid"
+    pid_file.write_text("not-an-integer")
+
+    runtime = OllamaRuntime(pid_file=str(pid_file))
+    runtime._resolution_attempted = True
+    runtime._resolved_executable = None
+    runtime.find_ollama_processes = lambda: []
+    runtime.port_is_open = lambda timeout=1.0: False
+
+    out = runtime.stop().as_dict()
+    assert out["terminated_pids"] == []
+    assert out["refused_pids"]
+    assert "does not contain an integer" in out["refused_pids"][0]["reason"]
+
+
+def test_stop_ollama_refuses_to_signal_the_ai_doctor_process(tmp_path):
+    """Even a PID file naming our own process must not cause self-termination."""
+    from runner.ollama_runtime import OllamaRuntime
+
+    pid_file = tmp_path / "ollama.pid"
+    pid_file.write_text(str(os.getpid()))
+
+    runtime = OllamaRuntime(pid_file=str(pid_file))
+    runtime._resolution_attempted = True
+    runtime._resolved_executable = None
+    runtime.find_ollama_processes = lambda: []
+    runtime.port_is_open = lambda timeout=1.0: False
+
+    out = runtime.stop().as_dict()
+    assert os.getpid() not in out["terminated_pids"]
+    assert any("AI Doctor process itself" in r["reason"] for r in out["refused_pids"])
+
+
+def test_accepts_the_real_service_pid_file(requires_real_ollama):
+    """
+    INTEGRATION - a PID file written by a verified start of the real daemon must
+    be accepted. Skips when Ollama is absent; never satisfied by a stand-in.
+    """
+    runtime = requires_real_ollama
+    assert runtime.start().success, "could not start the real daemon"
+
+    pid, reason = read_trusted_pid(runtime.pid_file)
+    assert reason is None
+    assert pid is not None
+    trusted, _ = is_trusted_ollama_pid(pid)
+    assert trusted is True
 
 
 # =========================================================================

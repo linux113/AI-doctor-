@@ -5,7 +5,8 @@
   "description": "AI Doctor - autonomous developer troubleshooting & recovery agent with read-only diagnostics and a strict remediation allowlist",
   "scripts": {
     "backend": "uvicorn backend.main:app --host 0.0.0.0 --port 8000",
-    "ollama": "python -m runner.ollama_service",
+    "ollama": "ollama serve",
+    "ollama:status": "curl -sS http://127.0.0.1:11434/api/tags",
     "dashboard": "npm --prefix frontend run dev",
     "test": "pytest tests/ -v",
     "test:core": "pytest tests/ -v --ignore=tests/test_ai_doctor.py"

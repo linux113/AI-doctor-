@@ -2,174 +2,82 @@
 Safe Remediation Functions for AI Doctor.
 All operations are strictly predefined and allowlisted.
 No user-input command execution, shell injection, eval, or exec is permitted.
+
+The two Ollama lifecycle actions delegate to `runner.ollama_runtime`, which
+drives the REAL `ollama` binary. There is no stand-in service: when Ollama is
+not installed these actions report OLLAMA_NOT_INSTALLED and fail, rather than
+substituting a Python HTTP server and calling it a recovery.
 """
 
-import sys
-import os
-import subprocess
-import time
-import signal
 import json
-import urllib.request
 import urllib.error
-import psutil
-from typing import Dict, Any, Optional
+import urllib.request
+from typing import Any, Dict, Optional
 
-from .diagnostics import check_port, check_ollama, check_process, record_log
-from .pidfile import (
-    DEFAULT_PID_FILE,
-    is_trusted_ollama_pid,
-    pid_file_permissions_warning,
-    read_trusted_pid,
-    remove_pid_file,
+from .diagnostics import record_log
+from .ollama_runtime import (
+    OLLAMA_NOT_INSTALLED,
+    get_runtime,
 )
-from .procmatch import OLLAMA_IDENTITIES, matches_process
+from .pidfile import DEFAULT_PID_FILE
+from .redaction import redact_sensitive_data
 from .security import validate_retry_url
 
-# Retained as an alias for backwards compatibility. The authoritative default
-# now lives in runner.pidfile so the writer and the reader cannot diverge.
+# Retained for backwards compatibility with existing imports/tests.
 OLLAMA_PID_FILE = DEFAULT_PID_FILE
 
 
 def start_ollama() -> Dict[str, Any]:
     """
-    Safely starts the local Ollama service daemon.
-    Predefined fixed command execution — no arbitrary input.
+    Allowlisted remediation: start the real Ollama daemon.
+
+    Delegates to `OllamaRuntime.start()`, which only reports success when the
+    spawned process is alive, the listening socket belongs to that process (or a
+    descendant), the port is open and the HTTP API answers. See defect D1 in
+    SECURITY.md: success used to be inferred from the port alone, so a foreign
+    listener on 11434 made a dead child look like a successful recovery.
     """
-    record_log("INFO", "AI Doctor executing predefined remediation: start_ollama()", service="remediation")
+    runtime = get_runtime()
+    record_log("INFO", "AI Doctor executing allowlisted remediation: start_ollama()", service="remediation")
 
-    # Check if already running
-    proc_status = check_process("ollama")
-    port_status = check_port(11434)
-    if proc_status["is_running"] and port_status["is_open"]:
-        record_log("INFO", "Ollama is already running and port 11434 is open.", service="remediation")
-        return {
-            "action": "start_ollama",
-            "success": True,
-            "message": "Ollama was already running and healthy.",
-            "pids": proc_status["pids"],
-        }
+    result = runtime.start()
 
-    # Start the Ollama process using python -m runner.ollama_service in a new process group
-    try:
-        # Launch detached server process
-        process = subprocess.Popen(
-            [sys.executable, "-m", "runner.ollama_service"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
+    if result.state == OLLAMA_NOT_INSTALLED:
+        record_log("ERROR", result.detail or "Ollama is not installed.", service="remediation")
+    elif result.success:
+        record_log("INFO", result.detail or "Ollama started.", service="remediation")
+    else:
+        record_log(
+            "ERROR",
+            f"start_ollama failed (state={result.state}, returncode={result.returncode}): {result.detail}",
+            service="remediation",
         )
 
-        # Wait up to 5 seconds for port 11434 to become active
-        started = False
-        for _ in range(25):
-            time.sleep(0.2)
-            if check_port(11434)["is_open"]:
-                started = True
-                break
-
-        if started:
-            record_log("INFO", f"Ollama daemon successfully started with PID {process.pid}.", service="remediation")
-            return {
-                "action": "start_ollama",
-                "success": True,
-                "pid": process.pid,
-                "message": f"Ollama daemon started successfully on port 11434 (PID: {process.pid}).",
-            }
-        else:
-            record_log("ERROR", "Ollama daemon started but port 11434 did not respond within timeout.", service="remediation")
-            return {
-                "action": "start_ollama",
-                "success": False,
-                "pid": process.pid,
-                "error": "Timeout waiting for Ollama to bind to port 11434.",
-            }
-    except Exception as e:
-        record_log("ERROR", f"Failed to start Ollama daemon: {str(e)}", service="remediation")
-        return {
-            "action": "start_ollama",
-            "success": False,
-            "error": str(e),
-        }
+    payload = result.as_dict()
+    # The captured child output may contain paths or credentials.
+    if payload.get("output_tail"):
+        payload["output_tail"] = redact_sensitive_data(payload["output_tail"])
+    return payload
 
 
 def stop_ollama() -> Dict[str, Any]:
     """
-    Safely stops any running Ollama process.
-    Used for intentional failure generation and clean recovery testing.
+    Allowlisted remediation / chaos trigger: stop the real Ollama daemon.
 
-    Every PID is identity-verified before it is signalled. See runner/pidfile.py
-    for why: the previous version trusted the contents of a world-writable
-    /tmp file, which let any local user direct this remediation at an
-    arbitrary process.
+    Targets are identified by executable path or exact process name. The AI
+    Doctor process is never signalled.
     """
-    record_log("WARN", "Intentional failure trigger: stopping Ollama service...", service="remediation")
-    killed_pids = []
-    refused = []
-    self_pid = os.getpid()
+    runtime = get_runtime()
+    record_log("WARN", "Intentional failure trigger: stopping real Ollama daemon...", service="remediation")
 
-    perms_warning = pid_file_permissions_warning(OLLAMA_PID_FILE)
-    if perms_warning:
-        record_log("SECURITY", perms_warning, service="remediation")
-
-    # Find matching processes in the process table.
-    for proc in psutil.process_iter(["pid", "name", "cmdline"]):
-        try:
-            pid = proc.info["pid"]
-            name = proc.info["name"] or ""
-            argv = proc.info["cmdline"] or []
-
-            if pid == self_pid:
-                # Never signal ourselves.
-                continue
-
-            # Identity, not mention. The previous substring test also matched
-            # wrapper shells, editors and `tail -f ollama.log`, so invoking
-            # this remediation could SIGTERM the very process that called it.
-            matched, _reason = matches_process(name, argv, OLLAMA_IDENTITIES, strict=True)
-            if not matched:
-                continue
-
-            # Re-verify through the shared identity check so the process table
-            # sweep and the PID file path enforce exactly the same policy.
-            trusted, reason = is_trusted_ollama_pid(pid)
-            if not trusted:
-                refused.append({"pid": pid, "reason": reason})
-                record_log("SECURITY", f"Refused to signal PID {pid}: {reason}", service="remediation")
-                continue
-
-            os.kill(pid, signal.SIGTERM)
-            killed_pids.append(pid)
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-            continue
-        except OSError:
-            continue
-
-    # The PID file is a hint, not authority: read_trusted_pid only returns a
-    # PID whose live process has already been confirmed to be our service.
-    pid_from_file, refusal_reason = read_trusted_pid(OLLAMA_PID_FILE)
-    if refusal_reason:
-        refused.append({"pid_file": OLLAMA_PID_FILE, "reason": refusal_reason})
-        record_log("SECURITY", f"Refusing PID file target: {refusal_reason}", service="remediation")
-    elif pid_from_file is not None and pid_from_file not in killed_pids:
-        try:
-            os.kill(pid_from_file, signal.SIGTERM)
-            killed_pids.append(pid_from_file)
-        except OSError:
-            pass
-
-    remove_pid_file(OLLAMA_PID_FILE)
-
-    time.sleep(0.5)
-    port_down = not check_port(11434)["is_open"]
-    record_log("INFO", f"Ollama service stopped. Terminated PIDs: {killed_pids}. Port 11434 closed: {port_down}", service="remediation")
-
-    return {
-        "action": "stop_ollama",
-        "terminated_pids": killed_pids,
-        "refused_pids": refused,
-        "port_11434_closed": port_down,
-    }
+    result = runtime.stop()
+    record_log(
+        "INFO",
+        f"Ollama stop complete (state={result.state}). Terminated PIDs: {result.terminated_pids}. "
+        f"Port closed: {result.port_closed}",
+        service="remediation",
+    )
+    return result.as_dict()
 
 
 def retry_request(
@@ -216,7 +124,7 @@ def retry_request(
             try:
                 parsed = json.loads(body)
             except Exception:
-                parsed = body
+                parsed = redact_sensitive_data(body)
 
             record_log("INFO", f"Retry request succeeded with HTTP {status_code}.", service="remediation")
             return {
@@ -226,18 +134,23 @@ def retry_request(
                 "response": parsed,
             }
     except urllib.error.HTTPError as e:
-        record_log("ERROR", f"Retry request failed with HTTP {e.code}: {e.reason}", service="remediation")
+        detail = redact_sensitive_data(f"{e.code} {e.reason}")
+        record_log("ERROR", f"Retry request failed with HTTP {detail}", service="remediation")
         return {
             "action": "retry_request",
             "success": False,
             "status_code": e.code,
-            "error": str(e),
+            "error_class": "HTTPError",
+            "error": detail,
         }
     except Exception as e:
-        record_log("ERROR", f"Retry request failed with network error: {str(e)}", service="remediation")
+        # Exception text can embed a URL carrying credentials; redact it.
+        detail = redact_sensitive_data(f"{type(e).__name__}: {e}")
+        record_log("ERROR", f"Retry request failed: {detail}", service="remediation")
         return {
             "action": "retry_request",
             "success": False,
             "status_code": 500,
-            "error": str(e),
+            "error_class": type(e).__name__,
+            "error": detail,
         }

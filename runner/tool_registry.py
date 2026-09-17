@@ -6,11 +6,13 @@ Enforces read-only tool contracts, parameter validation, and execution logging.
 from typing import Callable, Dict, Any, List
 from .diagnostics import (
     check_ollama,
+    check_ollama_runtime,
     check_port,
     check_process,
     get_recent_logs,
     health_check,
 )
+from .redaction import redact_sensitive_data
 
 
 class DiagnosticToolRegistry:
@@ -43,6 +45,15 @@ class DiagnosticToolRegistry:
             name="get_recent_logs",
             fn=get_recent_logs,
             description="Retrieves sanitized and credential-redacted recent application/service log lines.",
+            read_only=True,
+        )
+        self.register(
+            name="check_ollama_runtime",
+            fn=check_ollama_runtime,
+            description=(
+                "Reports the real Ollama runtime state (NOT_INSTALLED / STOPPED / UNHEALTHY / RUNNING), "
+                "the resolved executable path and its version. Read-only."
+            ),
             read_only=True,
         )
         self.register(
@@ -85,7 +96,8 @@ class DiagnosticToolRegistry:
             result = fn(**kwargs)
             return {"success": True, "result": result}
         except Exception as e:
-            return {"success": False, "error": str(e)}
+            # Exception text may embed arguments containing credentials.
+            return {"success": False, "error_class": type(e).__name__, "error": redact_sensitive_data(str(e))}
 
 
 # Global singleton instance

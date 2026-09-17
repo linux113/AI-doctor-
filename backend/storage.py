@@ -7,6 +7,7 @@ Allows drop-in replacement with boto3 DynamoDB resource in AWS Phase 2.
 from typing import Dict, List, Optional, Any
 from threading import Lock
 from .models import Incident
+from runner.redaction import sanitize_deep
 
 
 class IncidentRepository:
@@ -18,7 +19,12 @@ class IncidentRepository:
 
     def save(self, incident: Incident) -> Incident:
         with self._lock:
-            data = incident.to_dynamodb_item()
+            # Incident already redacts on construction; sanitising again at the
+            # persistence boundary is deliberate defence in depth. This is the
+            # exact call a boto3 DynamoDB/S3 client would sit behind, so nothing
+            # unredacted can reach durable storage even if a future caller
+            # builds a dict by hand instead of through the model.
+            data = sanitize_deep(incident.to_dynamodb_item())
             self._items[incident.incident_id] = data
             return incident
 
@@ -42,7 +48,9 @@ class IncidentRepository:
         with self._lock:
             if incident_id not in self._items:
                 return None
-            self._items[incident_id].update(updates)
+            merged = dict(self._items[incident_id])
+            merged.update(updates)
+            self._items[incident_id] = sanitize_deep(merged)
             return Incident(**self._items[incident_id])
 
     def get_latest(self) -> Optional[Incident]:

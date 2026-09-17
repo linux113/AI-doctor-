@@ -31,8 +31,10 @@ looks healthy and the failure is therefore unexplained, the score is low.
 Low confidence is a real signal to the caller, not a decoration.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+
+from .ollama_runtime import OLLAMA_NOT_INSTALLED
 
 # Probe count. Corroboration is expressed as a fraction of this.
 _TOTAL_PROBES = 3
@@ -71,6 +73,11 @@ class Diagnosis:
     contradicting_probes: List[str]
     evidence_consistent: bool = True
     notes: Optional[str] = None
+    # True when no allowlisted remediation can fix the root cause and a human
+    # has to act (e.g. the runtime is not installed).
+    requires_human: bool = False
+    # Authoritative runtime state from OllamaRuntime, when evidence carries it.
+    runtime_state: str = ""
 
     def as_dict(self) -> Dict[str, Any]:
         """
@@ -91,6 +98,8 @@ class Diagnosis:
             "contradicting_probes": self.contradicting_probes,
             "evidence_consistent": self.evidence_consistent,
             "notes": self.notes,
+            "requires_human": self.requires_human,
+            "runtime_state": self.runtime_state,
         }
 
 
@@ -113,6 +122,43 @@ def diagnose(evidence: Dict[str, Any], initial_error: str = "") -> Diagnosis:
     """
     p = _probe_flags(evidence)
     port_open, proc_running, api_available = p["port_open"], p["proc_running"], p["api_available"]
+
+    runtime = evidence.get("runtime") or {}
+    runtime_state = str(runtime.get("state") or "")
+
+    # ------------------------------------------------------------------
+    # H_ABS: the runtime is ABSENT. Checked before every outage hypothesis,
+    #      because a missing binary presents exactly like a dead daemon: port
+    #      closed, API refusing connections. Calling that an outage would imply
+    #      an allowlisted action can fix it. None can - installing software is
+    #      not remediation, and the allowlist deliberately has no such action.
+    # ------------------------------------------------------------------
+    if runtime_state == OLLAMA_NOT_INSTALLED:
+        note = (
+            "OLLAMA_NOT_INSTALLED is a configuration/absence finding, not a service outage. "
+            "No allowlisted action (start_ollama, stop_ollama, retry_request) can install "
+            "software, so start_ollama will fail with the same state and the incident stays "
+            "unresolved until a human installs Ollama or points OLLAMA_EXECUTABLE at it."
+        )
+        if proc_running:
+            note += (
+                " A process matching the 'ollama' identity is running, but no binary was "
+                "discoverable - it may have been started from a path that has since been removed."
+            )
+        return Diagnosis(
+            hypothesis="ollama_not_installed",
+            root_cause=(
+                "OLLAMA_NOT_INSTALLED: no ollama executable was found on PATH or in any "
+                "standard location. The runtime is absent from this machine."
+            ),
+            recommended_remediation="start_ollama",
+            confidence=_score_confidence(corroborating=3),
+            corroborating_probes=["check_ollama_runtime", "check_port", "check_ollama"],
+            contradicting_probes=[],
+            requires_human=True,
+            runtime_state=runtime_state,
+            notes=note,
+        )
 
     # ------------------------------------------------------------------
     # H0: IMPOSSIBLE COMBINATION - checked first, before any hypothesis that

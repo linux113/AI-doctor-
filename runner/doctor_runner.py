@@ -13,6 +13,7 @@ from .tool_registry import diagnostic_registry
 from .remediation_registry import remediation_registry
 from .diagnostics import record_log
 from .diagnosis import diagnose
+from .ollama_runtime import OLLAMA_NOT_INSTALLED, OLLAMA_RUNNING, OLLAMA_UNHEALTHY
 
 
 class DoctorRunner:
@@ -29,10 +30,15 @@ class DoctorRunner:
         port_data = self.diagnostic_registry.execute("check_port", port=11434)
         process_data = self.diagnostic_registry.execute("check_process", process_name="ollama")
         ollama_data = self.diagnostic_registry.execute("check_ollama")
+        runtime_data = self.diagnostic_registry.execute("check_ollama_runtime")
         logs_data = self.diagnostic_registry.execute("get_recent_logs", limit=10)
 
         return {
             "collected_at": now_iso(),
+            # Authoritative runtime state. Lets the engine report
+            # OLLAMA_NOT_INSTALLED instead of mistaking an absent binary for an
+            # outage - both look identical on a port/API probe.
+            "runtime": runtime_data.get("result", {}),
             "port_11434": port_data.get("result", {}),
             "process_ollama": process_data.get("result", {}),
             "ollama_api": ollama_data.get("result", {}),
@@ -59,6 +65,7 @@ class DoctorRunner:
         self,
         remediation_action: str,
         failed_request_context: Optional[Dict[str, Any]] = None,
+        incident_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Safely executes remediation from allowlist, verifies service health, and retries the original request.
@@ -92,7 +99,9 @@ class DoctorRunner:
                 "headers": ctx.get("headers"),
             }
 
-        remediation_result = self.remediation_registry.execute(remediation_action, **kwargs)
+        remediation_result = self.remediation_registry.execute(
+            remediation_action, incident_id=incident_id, **kwargs
+        )
         if not remediation_result.get("success", False):
             return {
                 "success": False,
@@ -104,21 +113,59 @@ class DoctorRunner:
                 "remediation_result": remediation_result.get("result"),
             }
 
-        # 2. VERIFY: Poll health check
+        # 2. VERIFY: poll the authoritative runtime state.
+        #
+        # Port-open plus an HTTP answer is not sufficient: any process listening
+        # on 11434 satisfies both, which is how a dead daemon used to be
+        # reported as a successful recovery (defect D1). OLLAMA_RUNNING requires
+        # a live process whose identity matches, an open port, and a healthy API.
         verified = False
         verification_details = None
+        last_state = None
         for attempt in range(15):
             time.sleep(0.3)
-            port_check = self.diagnostic_registry.execute("check_port", port=11434).get("result", {})
-            api_check = self.diagnostic_registry.execute("check_ollama").get("result", {})
-            if port_check.get("is_open") and api_check.get("is_available"):
+            runtime_check = self.diagnostic_registry.execute("check_ollama_runtime").get("result", {})
+            last_state = runtime_check.get("state")
+
+            if last_state == OLLAMA_RUNNING:
                 verified = True
                 verification_details = {
+                    "runtime_state": OLLAMA_RUNNING,
+                    "pid": runtime_check.get("pid"),
+                    "executable": runtime_check.get("executable"),
+                    "ollama_version": runtime_check.get("version"),
                     "port_open": True,
                     "api_available": True,
-                    "models_detected": api_check.get("response"),
+                    "api_status_code": runtime_check.get("api_status_code"),
                     "verification_time": now_iso(),
                 }
+                break
+
+            # The API answers and the port is open, but no process matched the
+            # ollama identity. That is a blind process probe (container or
+            # namespace boundary, insufficient permission), not an outage -
+            # record it as verified with the caveat made explicit.
+            if (
+                last_state == OLLAMA_UNHEALTHY
+                and runtime_check.get("api_healthy")
+                and runtime_check.get("port_open")
+            ):
+                verified = True
+                verification_details = {
+                    "runtime_state": last_state,
+                    "pid": None,
+                    "port_open": True,
+                    "api_available": True,
+                    "api_status_code": runtime_check.get("api_status_code"),
+                    "process_probe_blind": True,
+                    "verification_time": now_iso(),
+                }
+                record_log(
+                    "WARN",
+                    "Verification: the Ollama API answered on 11434 but no process matched "
+                    "the ollama identity; the process probe is likely blind here.",
+                    service="doctor_runner",
+                )
                 break
 
         if not verified:
@@ -126,7 +173,12 @@ class DoctorRunner:
                 "success": False,
                 "stage": "VERIFY",
                 "action": remediation_action,
-                "error": "Service verification failed: Port 11434 or Ollama API remained unavailable after restart.",
+                "runtime_state": last_state,
+                "error": (
+                    "Service verification failed: the Ollama runtime never reached the RUNNING "
+                    f"state after '{remediation_action}' (last observed state: {last_state}). "
+                    "A listener on port 11434 is not accepted as proof of recovery."
+                ),
             }
 
         record_log("INFO", "Service verification succeeded. Ollama is healthy on port 11434.", service="doctor_runner")
@@ -140,6 +192,7 @@ class DoctorRunner:
         elif ctx.get("url"):
             retry_res = self.remediation_registry.execute(
                 "retry_request",
+                incident_id=incident_id,
                 url=ctx["url"],
                 method=ctx.get("method", "GET"),
                 payload=ctx.get("payload"),
@@ -161,6 +214,12 @@ class DoctorRunner:
         """
         timeline = []
         now = now_iso
+
+        incident_id = incident_data.get("incident_id") or incident_data.get("id")
+
+        # Mark the audit log so this incident records exactly the remediation
+        # entries its own actions produced, rather than a shared global tail.
+        audit_mark = self.remediation_registry.audit_snapshot()
 
         # The Incident model stores the failure message as "detected_error";
         # callers building an ad-hoc dict may use "error". Reading only the
@@ -196,7 +255,13 @@ class DoctorRunner:
         recovery_outcome = self.run_remediation_and_verify(
             remediation_action=remediation_action,
             failed_request_context=incident_data.get("request_context"),
+            incident_id=incident_id,
         )
+
+        # First-class record of what the allowlisted action itself reported, and
+        # the audit trail of every allowlist decision taken for this incident.
+        action_result = recovery_outcome.get("remediation_result")
+        audit_log = self.remediation_registry.audit_since(audit_mark)
 
         # Which stage actually failed. "FIX" means the allowlisted action
         # itself reported failure; "VERIFY" means it ran but the service never
@@ -217,7 +282,8 @@ class DoctorRunner:
                 "action": remediation_action,
                 "allowlisted": self.remediation_registry.is_allowed(remediation_action),
                 "fix_succeeded": fix_succeeded,
-                "result": recovery_outcome.get("remediation_result"),
+                "result": action_result,
+                "audit_entries": len(audit_log),
                 "error": None if fix_succeeded else recovery_outcome.get("error"),
             },
         })
@@ -269,12 +335,23 @@ class DoctorRunner:
         return {
             # The Incident model keys this field "incident_id"; the previous
             # lookup used "id" and therefore always returned None.
-            "incident_id": incident_data.get("incident_id") or incident_data.get("id"),
+            "incident_id": incident_id,
             "status": final_status,
             "root_cause": diagnosis["root_cause"],
             "confidence": diagnosis.get("confidence"),
+            # Additive: the runtime state and whether a human must intervene.
+            "runtime_state": diagnosis.get("runtime_state") or (evidence.get("runtime") or {}).get("state"),
+            "requires_human": bool(diagnosis.get("requires_human")),
             "evidence": evidence,
             "action_taken": remediation_action,
+            # First-class outcome of the allowlisted action, distinct from the
+            # overall recovery verdict: an action can report success=False while
+            # the loop still records why.
+            "action_result": action_result,
+            # Every allowlist decision taken for this incident: timestamp,
+            # incident_id, action, allowed/blocked, result, error. Sanitised by
+            # the registry before it is stored.
+            "audit_log": audit_log,
             "verification": recovery_outcome.get("verification"),
             "retry_result": recovery_outcome.get("retry_result"),
             # Present only on failure: "FIX" or "VERIFY".

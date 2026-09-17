@@ -8,6 +8,10 @@ in `stop_ollama`'s kill list.
 A real decoy shell is spawned here on purpose: the defect is only reproducible
 with an actual process whose command line *mentions* the service without *being*
 it.
+
+Since the Python stand-in (`runner.ollama_service`) was deleted, the only Ollama
+identity is the real `ollama` binary. Tests that need a live daemon use
+`requires_real_ollama` and skip explicitly when it is absent.
 """
 
 import os
@@ -18,6 +22,7 @@ import psutil
 import pytest
 
 from runner.diagnostics import check_process
+from runner.ollama_runtime import OLLAMA_NOT_INSTALLED
 from runner.procmatch import OLLAMA_IDENTITIES, matches_process
 from runner.remediation import start_ollama, stop_ollama
 
@@ -25,12 +30,12 @@ from runner.remediation import start_ollama, stop_ollama
 @pytest.fixture
 def decoy_shell():
     """
-    A live process whose argv contains "runner.ollama_service" as part of a
-    longer string - exactly the shape of a wrapper shell, a script, an editor
-    or `tail -f`. It is not the service and must never be treated as such.
+    A live process whose argv mentions "ollama" inside a longer string - exactly
+    the shape of a wrapper shell, a script, an editor, a grep or `tail -f`.
+    It is not the runtime and must never be treated as such.
     """
     proc = subprocess.Popen(
-        ["/bin/bash", "-c", "sleep 45  # decoy mentioning runner.ollama_service"],
+        ["/bin/bash", "-c", "sleep 45  # decoy mentioning ollama serve"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -46,8 +51,14 @@ def decoy_shell():
 
 
 # =========================================================================
-# Matcher semantics
+# Matcher semantics (pure - no processes, no Ollama required)
 # =========================================================================
+
+
+def test_only_the_real_binary_is_an_identity():
+    """The deleted stand-in must not remain a recognised identity."""
+    assert OLLAMA_IDENTITIES == ("ollama",)
+    assert "runner.ollama_service" not in OLLAMA_IDENTITIES
 
 
 def test_exact_process_name_matches():
@@ -56,13 +67,19 @@ def test_exact_process_name_matches():
     assert "name" in reason.lower()
 
 
-def test_module_argument_matches_the_local_service():
+def test_the_deleted_module_form_is_no_longer_an_identity():
+    """
+    `python -m runner.ollama_service` used to be a valid identity because a
+    Python HTTP server impersonated Ollama. That module is gone, so this argv
+    must NOT match: keeping it would let any Python process claim to be the
+    runtime and be signalled by stop_ollama.
+    """
     matched, _ = matches_process(
         "python",
         ["/usr/bin/python3", "-m", "runner.ollama_service"],
         OLLAMA_IDENTITIES,
     )
-    assert matched is True
+    assert matched is False
 
 
 def test_binary_basename_matches_absolute_path():
@@ -74,7 +91,7 @@ def test_wrapper_shell_mentioning_the_service_does_not_match():
     """The core defect: argv contains the marker only inside a longer string."""
     matched, reason = matches_process(
         "bash",
-        ["/bin/bash", "-c", "/usr/bin/python3 -m runner.ollama_service"],
+        ["/bin/bash", "-c", "/usr/local/bin/ollama serve"],
         OLLAMA_IDENTITIES,
     )
     assert matched is False, "a wrapper shell must not be identified as the service"
@@ -82,23 +99,25 @@ def test_wrapper_shell_mentioning_the_service_does_not_match():
 
 def test_unrelated_process_mentioning_ollama_does_not_match():
     for argv in (
-        ["vim", "runner/ollama_service.py"],
+        ["vim", "/etc/ollama/config"],
         ["tail", "-f", "/var/log/ollama.log"],
         # "ollama" is a whole argument here, but it is search data rather than
         # an executable. Whole-argument equality alone is NOT sufficient; the
         # matcher must consider argument position.
         ["grep", "-r", "ollama", "."],
-        ["grep", "-rn", "runner.ollama_service", "."],
+        ["grep", "-rn", "ollama serve", "."],
         ["curl", "-sS", "http://127.0.0.1:8000/api/demo/stop-ollama"],
+        ["curl", "-sS", "http://127.0.0.1:11434/api/tags"],
         ["/bin/bash", "-l", "-c", 'echo "Processes whose cmdline mentions ollama"'],
         ["pytest", "tests/test_ollama_recovery.py"],
+        ["journalctl", "-u", "ollama"],
     ):
         matched, _ = matches_process(argv[0].split("/")[-1], argv, OLLAMA_IDENTITIES)
         assert matched is False, f"{argv} must not be identified as the Ollama runtime"
 
 
 def test_legacy_substring_mode_is_opt_in_only():
-    argv = ["/bin/bash", "-c", "python -m runner.ollama_service"]
+    argv = ["/bin/bash", "-c", "ollama serve"]
     assert matches_process("bash", argv, OLLAMA_IDENTITIES, strict=True)[0] is False
     assert matches_process("bash", argv, OLLAMA_IDENTITIES, strict=False)[0] is True
 
@@ -111,7 +130,7 @@ def test_custom_identity_does_not_inherit_ollama_aliases():
 
 
 # =========================================================================
-# Live behaviour: detection must not be fooled
+# Live behaviour: detection must not be fooled (no Ollama needed)
 # =========================================================================
 
 
@@ -122,20 +141,7 @@ def test_check_process_ignores_the_decoy_shell(decoy_shell):
     assert result["strict"] is True
 
 
-def test_check_process_finds_the_real_service(decoy_shell):
-    start_ollama()
-    try:
-        result = check_process("ollama")
-        assert result["is_running"] is True
-        assert result["pid_count"] >= 1
-        assert decoy_shell.pid not in result["pids"]
-        # Every reported PID must justify itself.
-        assert all(d.get("match_reason") for d in result["details"])
-    finally:
-        stop_ollama()
-
-
-def test_dead_daemon_is_not_reported_as_running_by_a_decoy(decoy_shell):
+def test_dead_daemon_is_not_reported_as_running_by_a_decoy(decoy_shell, ollama_state):
     """
     The exact live-sandbox failure: with the daemon dead but a decoy alive,
     check_process claimed it was running and the engine produced the wrong
@@ -150,17 +156,22 @@ def test_dead_daemon_is_not_reported_as_running_by_a_decoy(decoy_shell):
 
     evidence = doctor_runner.collect_evidence()
     d = diagnose(evidence, "ConnectionRefusedError")
-    assert d.hypothesis == "ollama_daemon_terminated"
+
+    if ollama_state == OLLAMA_NOT_INSTALLED:
+        # Absent runtime outranks the outage hypotheses - that is the point of
+        # the runtime probe. Either way, the decoy did not fool the engine into
+        # claiming a live daemon.
+        assert d.hypothesis == "ollama_not_installed"
+    else:
+        assert d.hypothesis == "ollama_daemon_terminated"
     assert d.confidence >= 0.85
-
-
-# =========================================================================
-# Live behaviour: the kill list must not include bystanders
-# =========================================================================
+    assert d.hypothesis != "ollama_process_hung_or_unbound"
 
 
 def test_stop_ollama_does_not_signal_the_decoy_shell(decoy_shell):
-    start_ollama()
+    """
+    The kill list must never contain a bystander - with or without a real daemon.
+    """
     out = stop_ollama()
 
     assert decoy_shell.pid not in out["terminated_pids"], (
@@ -168,13 +179,39 @@ def test_stop_ollama_does_not_signal_the_decoy_shell(decoy_shell):
     )
     assert decoy_shell.poll() is None, "the decoy shell was killed"
     assert out["port_11434_closed"] is True
-    start_ollama()
+    assert os.getpid() not in out["terminated_pids"], "stop_ollama must never signal itself"
 
 
-def test_stop_ollama_still_stops_the_real_service():
-    start_ollama()
-    assert psutil.pid_exists  # sanity: psutil imported
+# =========================================================================
+# Live behaviour: requires the real daemon
+# =========================================================================
+
+
+def test_check_process_finds_the_real_service(decoy_shell, requires_real_ollama):
+    runtime = requires_real_ollama
+    if runtime.health().state == OLLAMA_NOT_INSTALLED:
+        pytest.skip("no real Ollama runtime.")
+    runtime.start()
+    try:
+        result = check_process("ollama")
+        assert result["is_running"] is True
+        assert result["pid_count"] >= 1
+        assert decoy_shell.pid not in result["pids"]
+        # Every reported PID must justify itself.
+        assert all(d.get("match_reason") for d in result["details"])
+    finally:
+        pass
+
+
+def test_stop_ollama_still_stops_the_real_service(requires_real_ollama):
+    runtime = requires_real_ollama
+    assert runtime.start().success, "could not reach a running baseline"
+
     out = stop_ollama()
     assert out["port_11434_closed"] is True
-    assert out["terminated_pids"], "the real service should have been terminated"
-    start_ollama()
+    assert out["port_closed"] is True
+    assert out["terminated_pids"], "the real daemon should have been terminated"
+    assert out["success"] is True
+
+    # Restore for any later test.
+    runtime.start()

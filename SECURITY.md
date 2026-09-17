@@ -133,19 +133,20 @@ argument but is search data rather than an executable. Position is what
 disambiguates them.
 
 ```
-python -m runner.ollama_service            -> MATCH  (-m position)
 /usr/local/bin/ollama serve                -> MATCH  (argv[0] basename)
 ollama serve                               -> MATCH  (process name)
-bash -c "python -m runner.ollama_service"  -> no     (marker inside a longer arg)
+bash -c "ollama serve"                     -> no     (marker inside a longer arg)
 grep -r ollama .                           -> no     (marker is search data)
-vim runner/ollama_service.py               -> no     (marker is a file operand)
+vim /etc/ollama/config                     -> no     (marker is a file operand)
+curl -sS localhost:11434/api/tags          -> no     (marker is a URL operand)
 tail -f /var/log/ollama.log                -> no     (marker is a file operand)
+python -m runner.ollama_service            -> no     (identity deleted with the module)
 ```
 
 `strict=False` retains the legacy substring search for callers that genuinely
 want a fuzzy lookup; it is never used on a kill path.
 
-**Tests:** `tests/test_process_identity.py` (12), including a live decoy shell
+**Tests:** `tests/test_process_identity.py` (13), including a live decoy shell
 spawned to prove bystanders are neither counted nor killed.
 
 ---
@@ -417,9 +418,19 @@ Recorded so they are decisions rather than oversights.
   reached by exact process-name match. That is the documented intent of the
   chaos-testing remediation, but it is worth knowing on a workstation that runs
   Ollama for other purposes.
-- **The mock Ollama runtime binds `0.0.0.0:11434` with no authentication.** This
-  is required for the sandbox preview and is a stand-in for the real daemon, but
-  it should bind loopback in any environment that is not ephemeral.
+- **The real Ollama runtime is an external dependency this repo does not ship.**
+  The former Python stand-in was deleted (see §6). With no `ollama` binary the
+  agent reports `OLLAMA_NOT_INSTALLED`, every recovery attempt fails honestly,
+  and 13 integration tests skip. There is no offline mode and no substitute.
+- **Socket-owner attribution needs privilege.** `OllamaRuntime.listening_pid()`
+  reads `psutil.net_connections()`; unprivileged Linux often returns `pid=None`.
+  A `None` owner is treated as *unverified* and never adopted as proof of a
+  successful start, so the failure mode is safe — but the foreign PID cannot
+  always be named in the incident record.
+- **A blind process probe degrades RUNNING to UNHEALTHY.** In a container where
+  psutil cannot see the daemon, `health()` will not report `OLLAMA_RUNNING` even
+  though the API answers. The VERIFY stage detects this exact combination and
+  records `process_probe_blind: true` rather than failing the recovery outright.
 - **Redaction is denylist-based.** Regex redaction reduces leakage; it cannot
   prove absence. For Phase 2, pair it with CloudWatch Logs data-protection
   policies and keep secrets in Secrets Manager rather than in log lines.
@@ -434,6 +445,8 @@ Recorded so they are decisions rather than oversights.
 | `AIDOCTOR_CORS_ORIGINS` | `*` | Comma-separated allowed origins. Credentials are enabled only when this is not `*`. |
 | `AIDOCTOR_BACKEND_ORIGIN` | `http://127.0.0.1:8000` | Backend the Next.js proxy targets (used by both `next.config.js` and `src/middleware.ts`). |
 | `AIDOCTOR_OLLAMA_PID_FILE` | `/tmp/ollama.pid` | PID file path. Point at a non-world-writable directory such as `$XDG_RUNTIME_DIR` in production. |
+| `OLLAMA_EXECUTABLE` | *(unset)* | Absolute path to the `ollama` binary. Overrides discovery; still identity-verified with `ollama --version`. |
+| `OLLAMA_RUNTIME_LOG` | `/tmp/ai-doctor-ollama.log` | Where a spawned daemon's stdout/stderr is captured. A redacted tail is placed in the incident on a failed start. |
 
 Set `AIDOCTOR_API_TOKEN` on **both** the backend and the frontend; the frontend
 injects it server-side into the proxy so the browser never sees it.
@@ -443,18 +456,187 @@ injects it server-side into the proxy so the browser never sees it.
 ## 5. Test summary
 
 ```
-102 passed, 1 skipped
+160 passed, 0 failed, 13 skipped, 5 warnings        (173 collected)
+153 passed, 0 failed, 13 skipped, 1 warning         (product only: --ignore=tests/test_ai_doctor.py)
 ```
+
+All 13 skips share one reason: *the real Ollama runtime is not installed on this
+machine*. All 5 warnings are third-party deprecations (starlette/anyio, and two
+from `deepteam` imported by the quarantined medical component) — none originate
+in this repository's code.
 
 | Suite | Tests | Scope |
 |---|---|---|
-| `test_security_hardening.py` | 72 | F1, F2, F4, F5, F6, F7, F8, F9, F10, F11, F13 |
-| `test_process_identity.py` | 12 | F3, incl. a live decoy shell |
+| `test_security_hardening.py` | 76 | F1–F13, PID trust, registry verdicts, CORS, auth, redaction |
+| `test_defect_regressions.py` | 24 | **D1, D2, D3** and the Phase-6 audit trail |
+| `test_ollama_integration.py` | 17 | Runtime matrix **A–F** (§6) |
+| `test_process_identity.py` | 13 | F3, incl. a live decoy shell |
+| `test_retry.py` | 6 | Replay, SSRF guard, error classification |
+| `test_remediation_allowlist.py` | 6 | Allowlist enforcement and audit trail |
+| `test_ollama_recovery.py` | 6 | Recovery lifecycle + honest failure when absent |
+| `test_ollama_detection.py` | 6 | Probe shape, no fabricated payloads |
+| `test_verification.py` | 4 | VERIFY rejects lying actions and foreign listeners |
+| `test_port_detection.py` | 4 | TCP probe reports no identity |
 | `test_api_endpoints.py` | 3 | Full DETECT→DIAGNOSE→FIX→VERIFY→RETRY lifecycle |
-| `test_remediation_allowlist.py` | 5 | Allowlist enforcement and audit trail |
-| `test_ollama_detection.py`, `test_ollama_recovery.py`, `test_port_detection.py` | 5 | Probes and daemon lifecycle |
-| `test_failure_detection.py`, `test_retry.py`, `test_verification.py` | 5 | Failure injection, replay, verification |
-| `test_ai_doctor.py` | 7 *(skipped)* | Optional medical-triage component; skips without `deepeval` |
+| `test_failure_detection.py` | 1 | Failure injection and incident generation |
+| `test_ai_doctor.py` | 7 | **Quarantined** medical prototype — *not* product coverage |
 
-84 tests were added by this audit. All 18 pre-existing core tests still pass
-unchanged, and their assertions were not weakened to accommodate any fix.
+No assertion was weakened to accommodate a fix. Where a test's premise was
+removed (it asserted the behaviour of the deleted Python stand-in), the test was
+rewritten against the real runtime or converted to an explicit integration skip —
+never satisfied with a substitute server.
+
+---
+
+## 6. Corrective pass: D1/D2/D3 and removal of the fake Ollama
+
+A follow-up audit confirmed three defects in the code described above, plus a
+structural problem: the "Ollama daemon" was not Ollama.
+
+### 6.1 The fake runtime is deleted
+
+`runner/ollama_service.py` — a ~180-line Python `http.server` bound to
+`0.0.0.0:11434` answering `/api/tags` and `/api/generate` — was presented
+throughout the codebase and docs as the local Ollama daemon. It was not. Its
+consequences were not cosmetic:
+
+- every "successful recovery" the demo showed was the agent starting a Python
+  process and then verifying that same process;
+- `check_process` had to carry `runner.ollama_service` as an Ollama *identity*,
+  widening what `stop_ollama` was willing to signal;
+- canned responses (`"Models available: 1"`, a fixed `llama3:latest` model list)
+  let tests assert content the real runtime would never produce.
+
+It is deleted, and **no replacement stand-in exists**. `runner/ollama_runtime.py`
+now drives the real binary:
+
+| Concern | Implementation |
+|---|---|
+| Discovery | `$OLLAMA_EXECUTABLE` → `shutil.which("ollama")` → `/usr/local/bin`, `/usr/bin`, `/opt/ollama/bin`, `~/.ollama/bin`. No single hardcoded path. |
+| Identity | A candidate is accepted only if `<exe> --version` exits 0 and mentions `ollama`. A file merely named `ollama` is rejected. |
+| States | `OLLAMA_NOT_INSTALLED`, `OLLAMA_STOPPED`, `OLLAMA_UNHEALTHY`, `OLLAMA_RUNNING`, `OLLAMA_START_FAILED` |
+| Absent ≠ down | `NOT_INSTALLED` is reported as an absence requiring a human, never as an outage an allowlisted action can fix. |
+
+Interlock: `find_ollama_processes()` refuses to match by executable path when the
+resolved executable *is* the interpreter running AI Doctor. Discovery makes that
+impossible in production, but without the guard a misconfigured `OLLAMA_EXECUTABLE`
+would put every Python process on the host into `stop_ollama`'s kill list.
+
+### 6.2 D1 — false-positive recovery
+
+`start_ollama()` inferred success from `check_port(11434)`. Reproduced: the
+spawned child was dead (PID gone) while an unrelated listener held the port, and
+the incident was marked `RESOLVED`.
+
+`OllamaRuntime.start()` now retains the `Popen` and its PID immediately and polls
+the child throughout startup. Success requires **all four**:
+
+1. `proc.poll() is None` — the child is still alive;
+2. the port is open;
+3. the listening socket belongs to that child or a descendant (`listening_pid()`
+   + `_is_self_or_descendant()`);
+4. `GET /api/tags` answers successfully.
+
+A child that exits during startup returns `success=False` with its real
+`returncode` and a redacted tail of its captured output, and the detail states
+*"Recovery is NOT claimed"*. An open port held by a different process is recorded
+as `foreign_listener_pid` and rejected. `health()` was tightened to match:
+`OLLAMA_RUNNING` now requires an identified Ollama process, so an answering
+socket with no matching process is `OLLAMA_UNHEALTHY`.
+
+The VERIFY stage in `doctor_runner` was polling port+API only, so it could adopt
+the same false positive. It now requires `OLLAMA_RUNNING`, and the API endpoint
+`/api/demo/start-ollama` returns HTTP 500 with `{"status": "failed"}` instead of
+an unconditional `{"status": "started"}`.
+
+### 6.3 D2 — one authoritative sanitisation path
+
+`request_context`, `detected_error` and `evidence` were persisted and served
+verbatim, so a bearer token, API key or AWS credential in a failed request
+reached storage, the API and the dashboard.
+
+`runner/redaction.py` is now the single sanitisation path and is applied at the
+**data-model boundary**: a `model_validator(mode="after")` on `Incident` (and on
+`TimelineEvent`, whose `details` embed diagnostic output) runs `sanitize_deep()`
+over every free-form field. Because it fires on construction, no code path can
+forget it — persistence, every API response that serialises an `Incident`, and
+the future Bedrock/DynamoDB/S3 clients all inherit it. `IncidentRepository.save()`
+and `.update()` sanitise again at the storage boundary as defence in depth; that
+is the exact seam a boto3 client will sit behind.
+
+`sanitize_deep()` recurses through dict/list/tuple/set/str, leaves non-string
+scalars intact, never mutates its input, and is bounded (depth 32, 10 000 items,
+200 KB strings) so a hostile payload cannot turn redaction into unbounded
+recursion.
+
+It also redacts by **key**, not only by content pattern. `{"password": "hunter2"}`
+contains no `password=` substring anywhere, so content regexes cannot catch it —
+yet `request_context.payload` is exactly such an object. Keys matching
+`password|passwd|pwd|secret|api_key|access_key|token|bearer|authorization|
+credential|private_key|session_id|cookie` have their *string* values replaced
+with a typed marker. Non-string values under those keys (`{"token_count": 5}`)
+and all benign fields are preserved. Key rules apply only inside `sanitize_deep`,
+never to free text, so prose such as *"the password rotation policy is documented
+in the runbook"* is untouched.
+
+### 6.4 D3 — the real exception is preserved
+
+`demo_query()` caught the exception, discarded it, and stored one hardcoded
+`"ConnectionRefusedError: ... (Connection refused)"` string for **every** failure
+type. A timeout, a DNS failure, an HTTP 500 from Ollama and a reset connection
+were all reported identically.
+
+`_classify_upstream_error()` now derives `error_class` and `error_detail`
+structurally from the exception type, unwrapping `URLError.reason` so the class
+reported is the one that actually occurred:
+
+| Failure | `error_class` | `error_detail` |
+|---|---|---|
+| nothing listening | `ConnectionRefusedError` | connection refused by the URL |
+| upstream HTTP error | `HTTPError` | **preserves the status code**, e.g. `HTTP 503 (Service Unavailable)` |
+| no response in time | `TimeoutError` | names the budget, e.g. `did not respond within 3.0s` |
+| peer reset | `ConnectionResetError` | reset mid-request |
+| name resolution | `gaierror` | the resolver's own message |
+| other OS failure | the concrete subclass | `strerror` + `errno` |
+
+Both fields are persisted on the `Incident`, returned in the 500 body, and
+redacted before either happens.
+
+### 6.5 Phase 6 — first-class `action_result` and `audit_log`
+
+`Incident` gained `action_result`, `audit_log`, `error_class`, `error_detail`,
+`runtime_state` and `requires_human`. The remediation registry's audit entries
+now carry `incident_id` and are sanitised before storage; `execute()` takes
+`incident_id` as audit metadata that is **never forwarded to the action
+callable**, so it cannot alter what a remediation does. `audit_snapshot()` /
+`audit_since()` let a heal record exactly its own entries instead of scraping a
+shared global tail and attributing another incident's remediation to itself.
+`/api/heal` persists all of it, so the trail survives the lifecycle.
+
+### 6.6 Runtime test matrix A–F
+
+| # | Scenario | How it is covered here |
+|---|---|---|
+| A | installed + running | **integration**, `requires_real_ollama` — skips when absent |
+| B | installed + stopped | **integration**, `requires_real_ollama` — skips when absent |
+| C | unavailable / not installed | observed directly on this machine, plus deterministic doubles |
+| D | fails during startup | injected executable that exits non-zero; asserts failure, real returncode, captured output |
+| E | wrong process owns the port | ephemeral foreign listener + a child that never serves; asserts the listener is not adopted |
+| F | health endpoint unavailable | listener that answers HTTP 500; asserts `OLLAMA_UNHEALTHY` and the captured status code |
+
+D, E and F run the runtime against an **ephemeral** port with the executable
+injected directly, bypassing discovery. The injected programs are ordinary shell
+scripts that exit, sleep, or answer 500 — none claims to be Ollama, none binds
+11434, and every one of these tests asserts a *failure* or *absence* state, so
+they cannot pass by accidentally simulating a healthy runtime.
+
+### 6.7 Quarantined medical component
+
+`ai_doctor/` is a medical-triage chat prototype that nothing in `backend/`,
+`runner/`, `agent/` or `frontend/` imports. It is quarantined in place (not
+deleted) and documented in `ai_doctor/QUARANTINE.md`. Its 7 tests are **not**
+security coverage for this product and are excluded by `npm run test:core`. The
+medical framing that had leaked into product code (demo prompts in
+`backend/models.py`, `backend/main.py` and `frontend/src/app/page.tsx`) was
+replaced with infrastructure-domain text: this is a recovery agent for a local
+Ollama runtime, not a medical device.

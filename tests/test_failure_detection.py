@@ -13,7 +13,7 @@ def test_failure_detection_yields_500_and_creates_incident():
     # Stop Ollama to induce failure
     stop_ollama()
 
-    response = client.post("/api/demo/query", json={"prompt": "Diagnose chest pain"})
+    response = client.post("/api/demo/query", json={"prompt": "Diagnose connection failure"})
     assert response.status_code == 500
     data = response.json()
     assert data["status"] == "error"

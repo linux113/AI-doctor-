@@ -42,27 +42,24 @@ matches `grep -r ollama .`, where "ollama" is a whole argument but is search
 data, not an executable. Position is what disambiguates the two.
 
 Consequences, all intended:
-    python -m runner.ollama_service          -> MATCH  (-m position)
     /usr/local/bin/ollama serve              -> MATCH  (argv[0] basename)
     ollama serve                             -> MATCH  (process name)
-    bash -c "python -m runner.ollama_service"-> no     (marker is inside a longer arg)
+    bash -c "ollama serve"                   -> no     (inside a longer arg)
     grep -r ollama .                         -> no     (marker is search data)
-    vim runner/ollama_service.py             -> no     (marker is a file operand)
+    vim /etc/ollama/config                   -> no     (marker is a file operand)
     tail -f /var/log/ollama.log              -> no     (marker is a file operand)
-
-A runtime started as a plain script (`python runner/ollama_service.py`) is not
-matched, because matching the first operand would re-open the `vim`/`grep`
-holes. This project always launches with `-m`, so nothing is lost.
+    curl localhost:11434/api/tags            -> no     (marker is a URL operand)
 """
 
 import os
 from typing import List, Optional, Sequence, Tuple
 
-# Identities that legitimately refer to the Ollama runtime:
-#   "ollama"                -> the upstream daemon binary (name or argv[0] basename)
-#   "runner.ollama_service" -> this project's local runtime, started with
-#                              `python -m runner.ollama_service`
-OLLAMA_IDENTITIES: Tuple[str, ...] = ("ollama", "runner.ollama_service")
+# Identities that legitimately refer to the Ollama runtime. Since the Python
+# stand-in (`runner.ollama_service`) was removed, the only identity is the real
+# `ollama` binary, matched by process name, argv[0] or argv[0] basename.
+# `OllamaRuntime.find_ollama_processes()` additionally compares resolved
+# executable paths, which is stricter than name matching alone.
+OLLAMA_IDENTITIES: Tuple[str, ...] = ("ollama",)
 
 # Flag after which the next argument is a Python module name.
 _MODULE_FLAG = "-m"
@@ -73,7 +70,7 @@ def default_identities(process_name: str) -> Tuple[str, ...]:
     Identities to match for a requested process name.
 
     Asking for "ollama" means "the Ollama runtime", which in this project can
-    be either the upstream binary or the local `runner.ollama_service` module.
+    be the real `ollama` binary, invoked by absolute path or by bare name.
     Any other name matches only itself.
     """
     return OLLAMA_IDENTITIES if process_name.strip().lower() == "ollama" else (process_name,)

@@ -1,5 +1,5 @@
 """
-PID file handling for the local Ollama service.
+PID file handling for the Ollama runtime managed by AI Doctor.
 
 The vulnerability this closes
 -----------------------------
@@ -35,11 +35,14 @@ from .procmatch import OLLAMA_IDENTITIES, matches_process
 # (e.g. $XDG_RUNTIME_DIR). Defaults to the historical path for compatibility.
 DEFAULT_PID_FILE = os.environ.get("AIDOCTOR_OLLAMA_PID_FILE", "/tmp/ollama.pid")
 
-# Command-line marker identifying a process this project started. Kept for
-# callers that want the raw string; identity decisions go through
-# procmatch.matches_process, which compares whole arguments rather than
-# searching for this substring.
-SERVICE_MARKER = "runner.ollama_service"
+# Marker identifying the process this project manages. Kept for callers that
+# want the raw string; identity decisions go through procmatch.matches_process,
+# which compares whole arguments rather than searching for this substring.
+#
+# This used to be "runner.ollama_service", the Python stand-in that pretended to
+# be Ollama on port 11434. That module has been deleted: AI Doctor now drives the
+# real `ollama` binary, so the marker is the binary name.
+SERVICE_MARKER = "ollama"
 
 
 def write_pid_file(pid: int, path: str = DEFAULT_PID_FILE) -> bool:
@@ -117,9 +120,9 @@ def is_trusted_ollama_pid(pid: int) -> Tuple[bool, str]:
     except (psutil.AccessDenied, psutil.ZombieProcess):
         return False, "Process state could not be inspected; refusing to signal an unverified PID."
 
-    # Identity, never mention: a wrapper shell whose argv contains
-    # "python -m runner.ollama_service" as one long string is NOT the service,
-    # and signalling it would kill whatever invoked the remediation.
+    # Identity, never mention: a wrapper shell whose argv contains "ollama"
+    # inside one long string (bash -c "ollama serve", grep -r ollama .) is NOT
+    # the service, and signalling it would kill whatever invoked remediation.
     matched, reason = matches_process(name, argv, OLLAMA_IDENTITIES, strict=True)
     if matched:
         return True, reason
