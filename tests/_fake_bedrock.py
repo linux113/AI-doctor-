@@ -90,6 +90,7 @@ class FakeBedrockTransport:
         error: Optional[BaseException] = None,
         request_id: str = "REQ-fake-0001",
         emit_request_id_event: bool = True,
+        tool_name: Optional[str] = None,
     ):
         if fields is None and text is None and error is None:
             fields = dict(WELL_FORMED_REPLY)
@@ -100,6 +101,10 @@ class FakeBedrockTransport:
         self.error = error
         self.request_id = request_id
         self.emit_request_id_event = emit_request_id_event
+        # The tool name the model "answers with". Defaults to the structured-output
+        # tool; setting it to something unregistered is how a test simulates a model
+        # that invents a tool it was never given.
+        self.tool_name = tool_name or DiagnosisResult.__name__
         self.calls: List[Dict[str, Any]] = []
 
     # -- the canned Bedrock response ------------------------------------
@@ -109,7 +114,7 @@ class FakeBedrockTransport:
                 {
                     "toolUse": {
                         "toolUseId": "tu-fake-1",
-                        "name": DiagnosisResult.__name__,
+                        "name": self.tool_name,
                         "input": dict(self.fields),
                     }
                 }

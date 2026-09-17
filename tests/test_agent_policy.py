@@ -32,7 +32,8 @@ from agent.policy import (
 )
 from agent.schemas import DiagnosisResult
 from runner.diagnostics import get_recent_logs
-from runner.remediation_registry import REMEDIATION_ALLOWLIST
+from runner.doctor_runner import DoctorRunner
+from runner.remediation_registry import REMEDIATION_ALLOWLIST, RemediationRegistry
 
 VALID = {
     "hypothesis": "Ollama runtime is installed but not listening",
@@ -177,6 +178,82 @@ def test_forbidden_actions_are_refused_and_audited(action):
     assert decision.violation == "forbidden_action", action
 
     assert_audited(action[:40])
+
+
+# The two action names the requirement calls out explicitly. Both must be refused
+# BEFORE anything executes, and the refusal must be recorded as a forbidden
+# action rather than as an ordinary typo.
+REQUIREMENT_ACTIONS = ("arbitrary_shell_command", "delete_everything")
+
+
+@pytest.mark.parametrize("action", REQUIREMENT_ACTIONS)
+def test_the_actions_named_in_the_requirement_are_refused_before_execution(action):
+    """
+    Requirement: the policy gate rejects these before execution, only the
+    remediation allowlist can ever execute, and the model cannot call remediation
+    directly.
+
+    Asserted at all three layers, because a gate that only exists in one of them
+    is a gate an attacker can route around:
+
+      1. the agent policy gate refuses and escalates;
+      2. the remediation registry has nothing to run and blocks the call;
+      3. the runner therefore takes no action at all.
+    """
+    # --- 1. policy gate ---------------------------------------------------
+    decision = validate_diagnosis(diagnosis(recommended_action=action), KNOWN_EVIDENCE,
+                                  "inc-requirement")
+    assert decision.allowed is False, action
+    assert decision.approved_action is None, action
+    assert decision.requires_human is True, action
+    assert decision.violation == "forbidden_action", (
+        f"{action!r} was refused as {decision.violation!r}; a destructive or "
+        "command-execution request must be recorded as forbidden, not as a typo"
+    )
+    assert action in decision.reason
+
+    # --- 2. remediation registry ------------------------------------------
+    registry = RemediationRegistry()
+    assert registry.is_allowed(action) is False
+    assert action not in REMEDIATION_ALLOWLIST
+
+    # Nothing can be registered under that name either, so there is no callable
+    # for an execution to reach even in principle.
+    with pytest.raises(Exception) as blocked:
+        registry.register(action, lambda **kwargs: {"success": True}, "invented action")
+    assert "REMEDIATION_ALLOWLIST" in str(blocked.value)
+
+    result = registry.execute(action, incident_id="inc-requirement")
+    assert result["success"] is False, action
+    assert "BLOCKED" in result["error"], result["error"]
+    assert result.get("result") is None, "something ran"
+
+    # --- 3. the runner takes no action ------------------------------------
+    outcome = DoctorRunner().run_remediation_and_verify(action, incident_id="inc-requirement")
+    assert outcome["success"] is False
+    assert outcome["stage"] == "FIX", "it must fail at the action stage, never later"
+    assert outcome.get("retry_result") is None, "a request was replayed for a refused action"
+    assert action in str(outcome.get("error"))
+
+
+@pytest.mark.parametrize("action", REQUIREMENT_ACTIONS)
+def test_a_destructive_recommendation_is_blocked_in_the_audit_trail(action):
+    """
+    The trail a security reviewer reads. A destructive request must be logged as
+    BLOCKED by the allowlist, with the action named, so it is distinguishable from
+    an ordinary refused recommendation.
+    """
+    registry = RemediationRegistry()
+    mark = registry.audit_snapshot()
+    registry.execute(action, incident_id="inc-audit")
+    entries = registry.audit_since(mark)
+
+    assert entries, "executing a forbidden action produced no audit entry at all"
+    entry = entries[-1]
+    assert entry["action"] == action
+    assert entry["allowed"] is False
+    assert entry["status"] in ("BLOCKED", "DENIED", "FAILED"), entry["status"]
+    assert entry["result"] is None
 
 
 def test_stop_ollama_is_in_the_runner_allowlist_but_not_model_permitted():

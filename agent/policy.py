@@ -85,6 +85,21 @@ FORBIDDEN_ACTION_TOKENS = (
     "rmdir",
     "del",
     "kill",
+    # Destructive vocabulary. Without these, a recommendation such as
+    # "delete_everything" was refused only by the generic not-permitted branch, so
+    # the audit log recorded "Refused non-permitted model recommendation" for what
+    # was really a destructive request. Both are refusals, but a security reviewer
+    # reading the trail needs to be able to tell them apart.
+    "delete",
+    "destroy",
+    "wipe",
+    "purge",
+    "truncate",
+    "drop",
+    "remove",
+    "uninstall",
+    "halt",
+    "format",
     "sudo",
     "chmod",
     "chown",

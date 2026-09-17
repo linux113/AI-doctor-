@@ -21,8 +21,15 @@ import pytest
 
 from agent.policy import FORBIDDEN_ACTION_TOKENS, validate_diagnosis
 from agent.prompts import EVIDENCE_FENCE, SYSTEM_PROMPT, build_user_prompt
+import pathlib
+
 from agent.schemas import DiagnosisResult
-from agent.strands_agent import STATUS_DIAGNOSED, STATUS_REQUIRES_HUMAN
+from agent.tools import ALLOWED_TOOL_NAMES, ToolBudget, build_diagnostic_tools
+from agent.strands_agent import (
+    STATUS_BEDROCK_SCHEMA_REFUSED,
+    STATUS_DIAGNOSED,
+    STATUS_REQUIRES_HUMAN,
+)
 from runner.remediation_registry import REMEDIATION_ALLOWLIST
 
 from _fake_bedrock import (
@@ -211,7 +218,9 @@ def test_defanging_is_applied_by_the_prompt_builder_directly():
 @pytest.mark.parametrize(
     "persuaded_action",
     ["run_command", "shell", "bash", "curl", "python", "exec", "eval", "subprocess",
-     "sudo", "stop_ollama", "disable_security", "send_credentials"],
+     "sudo", "stop_ollama", "disable_security", "send_credentials",
+     # The two action names the requirement calls out explicitly.
+     "arbitrary_shell_command", "delete_everything"],
 )
 def test_a_persuaded_model_cannot_get_an_action_executed(persuaded_action):
     """
@@ -236,6 +245,78 @@ def test_a_persuaded_model_cannot_get_an_action_executed(persuaded_action):
     assert outcome.policy.approved_action is None
     assert outcome.report["recommended_remediation"] == "none"
     assert outcome.report["requires_human"] is True
+
+
+# =========================================================================
+# 4. The model can never invent a tool
+# =========================================================================
+
+
+@pytest.mark.parametrize("invented", ["run_shell_command", "execute_command", "bash",
+                                      "start_ollama", "delete_everything"])
+def test_a_model_that_invents_a_tool_gets_nothing_executed(invented):
+    """
+    Requirement: the model never receives a command-execution tool, and it cannot
+    invent one.
+
+    This simulates the worst case - a model that answers by *calling* a tool that
+    was never registered, including the remediation actions it is not allowed to
+    invoke directly. The Strands tool registry has no such tool, so nothing runs:
+    the SDK refuses the call, no structured diagnosis is produced, and the incident
+    escalates to a human instead of quietly reporting success.
+
+    Note `start_ollama` in the list: it is a real allowlisted remediation, but the
+    model must recommend it through the policy gate, never call it as a tool.
+    """
+    transport = FakeBedrockTransport(fields=dict(WELL_FORMED_REPLY), tool_name=invented)
+    agent = make_transport_agent(bedrock_config(), transport)
+    outcome = agent.diagnose(INCIDENT, DOWN_EVIDENCE, BASELINE, "inc-invented-tool")
+
+    # The invented tool was never offered to the model in the first place.
+    offered = [
+        (tool.get("toolSpec") or {}).get("name")
+        for tool in (transport.last_request.get("toolConfig") or {}).get("tools", [])
+    ]
+    assert invented not in offered, f"{invented!r} was offered to the model: {offered}"
+    assert set(offered) == set(ALLOWED_TOOL_NAMES) | {DiagnosisResult.__name__}, offered
+    assert not (set(offered) & set(REMEDIATION_ALLOWLIST)), (
+        f"a remediation action was offered as a tool: {set(offered) & set(REMEDIATION_ALLOWLIST)}"
+    )
+
+    # Nothing was executed and nothing was fabricated.
+    assert outcome.structured is None, "an invented tool call produced a diagnosis"
+    assert outcome.used_llm is False
+    assert outcome.bedrock_status == STATUS_BEDROCK_SCHEMA_REFUSED, (
+        "the round trip happened but produced no usable structured output"
+    )
+    assert outcome.status == STATUS_REQUIRES_HUMAN
+    assert outcome.report["recommended_remediation"] == "none"
+    assert outcome.report["requires_human"] is True
+
+    # The attempt is still recorded, so an operator can see what the model asked
+    # for - honesty about the request, not about an execution that never happened.
+    assert invented in (outcome.telemetry.tool_calls or {}), outcome.telemetry.tool_calls
+
+
+def test_no_execution_capability_exists_for_a_tool_call_to_reach():
+    """
+    The structural half of the same requirement: even a fully persuaded model has
+    nothing to call. No registered tool can execute a command, and the policy
+    module - the thing that decides what runs - exposes no execution capability.
+    """
+    import agent.policy as policy_module
+    import agent.tools as tools_module
+
+    budget = ToolBudget(4)
+    tools = build_diagnostic_tools(budget)
+    names = {getattr(tool, "tool_name", None) for tool in tools}
+    assert names == set(ALLOWED_TOOL_NAMES), names
+    assert not (names & set(REMEDIATION_ALLOWLIST)), "a remediation is callable as a tool"
+
+    for module in (policy_module, tools_module):
+        source = pathlib.Path(module.__file__).read_text()
+        for forbidden in ("eval(", "exec(", "os.system(", "shell=True", "subprocess.run("):
+            assert forbidden not in source, f"{module.__name__} contains {forbidden}"
 
 
 def test_injected_json_that_looks_like_a_reply_is_data_not_a_reply():
