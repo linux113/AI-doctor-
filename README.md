@@ -1,6 +1,6 @@
-# AI Doctor with DeepTeam Red Teaming & Guardrails
+# AI Doctor with DeepTeam Red Teaming & Agency Agents
 
-An AI-powered medical triage and informational assistant equipped with **[DeepTeam](https://github.com/confident-ai/deepteam)** LLM red teaming and real-time safety guardrails.
+An AI-powered medical triage and informational assistant equipped with **[DeepTeam](https://github.com/confident-ai/deepteam)** LLM red teaming, real-time safety guardrails, and **[Agency Agents](https://github.com/msitarzewski/agency-agents)** specialist developer personas.
 
 ---
 
@@ -27,8 +27,9 @@ An AI-powered medical triage and informational assistant equipped with **[DeepTe
     - `Toxicity` & `Bias`
   - Multiple attack methods: `PromptInjection`, `Roleplay`, `Leetspeak`, `ROT13`.
 
-- **DeepTeam CLI Integration (`deepteam_config.yaml`)**:
-  - Standard YAML configuration allowing execution via `deepteam run deepteam_config.yaml`.
+- **Agency Agents Integration (`agency-agents`)**:
+  - Full catalog of 279 specialist agents installed across 18 divisions (Healthcare, Security, Engineering, Testing, etc.).
+  - Configured for Claude Code (`~/.claude/agents`), Cursor IDE (`.cursor/rules`), Codex (`~/.codex/agents`), Copilot (`~/.copilot/agents`), and Gemini CLI (`~/.gemini/agents`).
 
 ---
 
@@ -41,31 +42,35 @@ AI-doctor-/
 ├── pyproject.toml             # Package and pytest configuration
 ├── deepteam_config.yaml       # DeepTeam CLI red teaming config
 ├── example_redteam.py         # Quickstart verification script
+├── .cursor/rules/             # 279 Agency Agents rules for Cursor IDE
 ├── tests/
-│   └── test_ai_doctor.py      # Pytest test suite
+│   └── test_ai_doctor.py      # Pytest test suite (7/7 tests passing)
 └── ai_doctor/
     ├── __init__.py            # Package exports
     ├── assistant.py           # Medical triage assistant logic & safety prompts
     ├── callback.py            # DeepEval/DeepTeam model callback wrapper
     ├── guardrails.py          # DeepTeam real-time input/output guardrails
     ├── redteam_evaluation.py  # DeepTeam red teaming test runner
-    └── cli.py                 # Interactive terminal chat with live guardrails
+    ├── cli.py                 # Interactive terminal chat with live guardrails
+    ├── web.py                 # FastAPI backend for web portal
+    └── static/index.html      # Clinical chat & Red Teaming Audit UI
 ```
 
 ---
 
 ## Installation
 
-Install dependencies directly from GitHub and PyPI:
-
+### 1. Install DeepTeam & Python Dependencies
 ```bash
 pip install -r requirements.txt
 ```
 
-Or install `deepteam` directly via Git:
-
+### 2. Agency Agents Catalog
+The full repository is installed in `/home/user/agency-agents`:
 ```bash
-pip install git+https://github.com/confident-ai/deepteam.git sentry-sdk opentelemetry-exporter-otlp-proto-grpc
+# Re-run installer if needed for specific tools:
+cd /home/user/agency-agents
+./scripts/install.sh --tool claude-code,cursor,copilot,codex,gemini-cli --no-interactive
 ```
 
 ---
@@ -84,14 +89,21 @@ Run unit and integration tests:
 pytest -v
 ```
 
-### 3. Interactive Chat with Guardrails
-Launch the interactive AI Doctor CLI with active DeepTeam Guardrails:
+### 3. Interactive Web Dashboard
+Run the FastAPI web application with live preview:
+```bash
+uvicorn ai_doctor.web:app --host 0.0.0.0 --port 8000
+```
+Open `http://localhost:8000` to access:
+- **Clinical Consultation**: Interactive chat with real-time DeepTeam Guardrail chips.
+- **DeepTeam Red Team Audit**: Automated adversarial matrix testing defenses.
+
+### 4. Interactive Terminal Chat
 ```bash
 python3 -m ai_doctor.cli
 ```
-*Tip: You can type `guardrails` in the chat to toggle guardrail inspection on and off.*
 
-### 4. Running Red Teaming Evaluation
+### 5. Running Red Teaming Evaluation
 
 #### Via Python Script:
 ```bash
@@ -104,4 +116,3 @@ python3 -m ai_doctor.redteam_evaluation
 export OPENAI_API_KEY="your-api-key"
 deepteam run deepteam_config.yaml
 ```
-Results and risk assessments will be output to the configured reports folder (`redteam_reports/`).
