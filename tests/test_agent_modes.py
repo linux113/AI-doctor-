@@ -342,9 +342,71 @@ def test_runner_path_with_fallback_disabled_approves_no_action(no_credentials, m
     assert report["used_llm"] is False
     assert report["recommended_remediation"] == "none"
     assert report["requires_human"] is True
-    assert report["used_llm"] is False
     assert report["bedrock_failure"]["error_class"] == "NoCredentialsError"
     assert report["agent_telemetry"]["model_id"] is None
+
+
+@pytest.mark.parametrize("forbidden_action", ["arbitrary_shell_command", "delete_everything"])
+def test_a_forbidden_recommendation_is_blocked_and_visible_in_the_timeline(
+    forbidden_action, monkeypatch
+):
+    """
+    The two layers of requirement 8, end to end through the runner.
+
+    A model that recommends a destructive or command-execution action must be
+    refused by the policy gate BEFORE anything executes, the refusal must be its
+    own visible timeline stage, and the incident must end unresolved with no
+    action taken. Nothing here can start, stop or delete anything.
+    """
+    transport = FakeBedrockTransport(
+        fields={**WELL_FORMED_REPLY, "recommended_action": forbidden_action}
+    )
+    # The seam is the class the runner instantiates; behind it the real Agent, the
+    # real BedrockModel and the real request building are unchanged.
+    monkeypatch.setattr(
+        "agent.diagnosis_agent.BedrockDiagnosisAgent",
+        lambda config: make_transport_agent(config, transport),
+    )
+    monkeypatch.setenv("AI_DOCTOR_AGENT_MODE", "bedrock")
+    monkeypatch.setenv("AI_DOCTOR_AWS_REGION", "us-east-1")
+    monkeypatch.setenv("AI_DOCTOR_BEDROCK_MODEL_ID", "anthropic.claude-3-5-haiku-20241022-v1:0")
+
+    result = doctor_runner.heal_incident({
+        "incident_id": "inc-forbidden-timeline",
+        "detected_error": "connection refused on 127.0.0.1:11434",
+    })
+
+    # The gate refused it, and named why.
+    assert result["policy_decision"]["allowed"] is False
+    assert result["policy_decision"]["violation"] == "forbidden_action"
+    assert result["policy_decision"]["approved_action"] is None
+
+    # Nothing executed.
+    assert result["action_taken"] == "none"
+    assert result["status"] == "FAILED"
+    assert result["resolved_at"] is None
+    assert result["used_llm"] is True, "a model did answer; it was simply overruled"
+    assert result["requires_human"] is True
+    assert [e["action"] for e in result["audit_log"] if e.get("executed")] == []
+
+    # And the refusal is a stage a reader can see, not a buried detail.
+    policy_entry = next(
+        e for e in result["timeline"] if e["stage_code"] == "POLICY_CHECK"
+    )
+    assert policy_entry["details"]["allowed"] is False
+    assert policy_entry["details"]["requested_action"] == forbidden_action
+    assert policy_entry["details"]["violation"] == "forbidden_action"
+    assert "BLOCKED" in policy_entry["description"]
+    assert forbidden_action in policy_entry["description"]
+
+    # The AI_DIAGNOSIS stage records what the model asked for and that a model
+    # really answered - the refusal is not presented as an outage.
+    ai_entry = next(e for e in result["timeline"] if e["stage_code"] == "AI_DIAGNOSIS")
+    assert ai_entry["details"]["ai_diagnosis"]["recommended_action"] == "none", (
+        "the refused action must not be echoed as the recommendation"
+    )
+    assert ai_entry["details"]["ai_diagnosis"]["used_llm"] is True
+    assert "Amazon Bedrock model" in ai_entry["description"]
 
 
 def test_runner_path_in_default_mode_stays_deterministic(monkeypatch):

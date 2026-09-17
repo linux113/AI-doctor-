@@ -55,6 +55,10 @@ interface AgentTelemetry {
   strands_sdk_version?: string | null;
   error_class?: string | null;
   error_detail?: string | null;
+  // Stable machine-readable failure classification, and the AWS service code
+  // behind it. Both null on a successful call.
+  failure_kind?: string | null;
+  aws_error_code?: string | null;
 }
 
 interface SystemStatus {
@@ -98,7 +102,15 @@ interface Incident {
   // Which engine produced this diagnosis. Present on every incident so the UI
   // can never imply a model answered when the offline rule engine did.
   agent_mode?: string | null;
+  // agent_status is the ROUND TRIP (what Bedrock did); diagnosis_outcome is the
+  // DECISION (what the pipeline concluded). bedrock_invoked is true only when a
+  // real request reached Bedrock and answered; used_llm only when a model
+  // produced the validated diagnosis. The UI must not claim an AI diagnosis
+  // unless used_llm is true.
   agent_status?: string | null;
+  diagnosis_outcome?: string | null;
+  bedrock_invoked?: boolean | null;
+  used_llm?: boolean | null;
   agent_note?: string | null;
   model_id?: string | null;
   aws_region?: string | null;
@@ -114,7 +126,9 @@ interface Incident {
     requires_human?: boolean;
   } | null;
   bedrock_failure?: {
+    failure_kind?: string;
     error_class?: string;
+    aws_error_code?: string | null;
     error_detail?: string;
     attempted_model_id?: string | null;
     attempted_region?: string | null;
@@ -254,8 +268,23 @@ export default function AIDoctorDashboard() {
         body: JSON.stringify({ incident_id: latestIncident.incident_id }),
       });
       const data = await res.json();
+      // Every word here is read from what the backend actually verified. The
+      // previous text claimed "original request retried successfully" whenever the
+      // incident resolved, but RESOLVED only means the service came back - the
+      // replayed request can still have failed, or there may have been nothing
+      // captured to replay.
       if (data.outcome?.status === 'RESOLVED') {
-        setActionMessage(`Heal complete! Service verified on port 11434 and original request retried successfully.`);
+        const retry = data.outcome?.retry_result;
+        const verified = data.outcome?.verification;
+        const state = verified?.runtime_state ? ` (${verified.runtime_state})` : '';
+        const replay = !retry
+          ? 'No captured request was available to replay.'
+          : retry.success
+          ? `The original request was replayed and returned ${retry.status_code ?? 200}.`
+          : `The replayed request did NOT succeed (${
+              retry.error ?? retry.status_code ?? 'unknown'
+            }).`;
+        setActionMessage(`Service verified${state}. ${replay}`);
       } else {
         setActionMessage(`Healing attempted: ${data.outcome?.error || 'Verification pending'}`);
       }
@@ -673,15 +702,21 @@ export default function AIDoctorDashboard() {
                     Diagnosis:{' '}
                     <span
                       className={
-                        latestIncident.agent_mode === 'bedrock'
+                        latestIncident.used_llm
                           ? 'text-indigo-300 font-bold'
+                          : latestIncident.agent_mode === 'bedrock'
+                          ? 'text-amber-300 font-bold'
                           : 'text-slate-200 font-bold'
                       }
                     >
-                      {latestIncident.agent_mode === 'bedrock'
+                      {latestIncident.used_llm
                         ? `AWS Strands + Amazon Bedrock${
                             latestIncident.model_id ? ` (${latestIncident.model_id})` : ''
                           }`
+                        : latestIncident.agent_mode === 'bedrock'
+                        ? latestIncident.diagnosis_outcome === 'FAILED'
+                          ? 'Amazon Bedrock was requested but produced no diagnosis'
+                          : 'Amazon Bedrock answered but returned no usable diagnosis'
                         : 'deterministic rule engine (no model invoked)'}
                     </span>
                     {latestIncident.agent_status && (
@@ -702,7 +737,11 @@ export default function AIDoctorDashboard() {
                   )}
                   {latestIncident.bedrock_failure && (
                     <div className="text-amber-300/90 leading-relaxed">
-                      Bedrock unavailable ({latestIncident.bedrock_failure.error_class}) —{' '}
+                      Bedrock unavailable
+                      {latestIncident.bedrock_failure.failure_kind
+                        ? ` [${latestIncident.bedrock_failure.failure_kind}]`
+                        : ''}{' '}
+                      ({latestIncident.bedrock_failure.error_class}) —{' '}
                       {latestIncident.bedrock_failure.error_detail}
                     </div>
                   )}
@@ -951,13 +990,31 @@ export default function AIDoctorDashboard() {
           </div>
 
           <div className="p-4 bg-slate-900/40 border border-slate-800/80 rounded-xl">
-            <div className="flex items-center space-x-2 text-indigo-400 font-bold mb-1">
+            <div
+              className={`flex items-center space-x-2 font-bold mb-1 ${
+                status?.agent?.llm_operational ? 'text-indigo-400' : 'text-slate-400'
+              }`}
+            >
               <Cpu className="w-4 h-4" />
-              <span>AWS Strands & Bedrock Ready</span>
+              {/* Read from /api/system-status, never asserted statically: "Ready"
+                  on a machine with no SDK and no credentials would be a lie the
+                  dashboard tells before anyone runs an incident. */}
+              <span>
+                {status?.agent?.llm_operational
+                  ? 'AWS Strands + Bedrock Operational'
+                  : status?.agent?.mode_uses_llm
+                  ? 'AWS Strands + Bedrock Not Operational'
+                  : 'AWS Strands + Bedrock Not Configured'}
+              </span>
             </div>
             <p className="text-slate-400 leading-relaxed">
-              Clean contracts ready for Phase 2 Strands Agent runtime and Amazon Bedrock (Claude
-              3.5 Sonnet) reasoning.
+              {status?.agent?.llm_operational
+                ? `Real agent runtime: ${status.agent.provider ?? 'AWS Strands'}${
+                    status.agent.model_id ? ` • ${status.agent.model_id}` : ''
+                  }${status.agent.aws_region ? ` • ${status.agent.aws_region}` : ''}.`
+                : status?.agent?.mode_uses_llm
+                ? 'Bedrock mode is configured but cannot be used right now. Incidents will say so explicitly rather than presenting a rule-engine result as a model diagnosis.'
+                : 'Deterministic offline mode: no model is invoked and no AWS call is made. Set AI_DOCTOR_AGENT_MODE=bedrock with credentials to use the real agent.'}
             </p>
           </div>
 
@@ -967,8 +1024,9 @@ export default function AIDoctorDashboard() {
               <span>DynamoDB Schema Compatible</span>
             </div>
             <p className="text-slate-400 leading-relaxed">
-              Incident records strictly match the DynamoDB table specification with sort keys and
-              status GSIs.
+              Incident records are shaped for the DynamoDB table specification (sort keys and status
+              GSIs), but nothing is deployed: no Lambda, API Gateway or DynamoDB table exists. The
+              local Bedrock path is validated first.
             </p>
           </div>
         </section>

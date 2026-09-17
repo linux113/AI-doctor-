@@ -37,7 +37,16 @@ _SENSITIVE_TIMELINE_FIELDS = ("description", "details")
 
 
 class TimelineEvent(BaseModel):
-    stage: str  # DETECTED, INVESTIGATING, ROOT CAUSE FOUND, REMEDIATION, VERIFYING, RESOLVED, FAILED
+    # Human-readable stage, as it has always been rendered: DETECTED,
+    # INVESTIGATING, ROOT CAUSE FOUND, POLICY CHECK, REMEDIATION, VERIFYING,
+    # RETRY, RESOLVED, FAILED.
+    stage: str
+    # Machine-readable stage from the fixed pipeline vocabulary in
+    # runner.doctor_runner.STAGE_CODES: DETECTED, EVIDENCE_COLLECTED,
+    # AI_DIAGNOSIS, POLICY_CHECK, REMEDIATION_STARTED, VERIFICATION, RETRY,
+    # RECOVERED, FAILED. A consumer must branch on this, never on the display
+    # string, and the two are emitted together so they cannot drift apart.
+    stage_code: Optional[str] = None
     timestamp: str
     description: str
     details: Optional[Dict[str, Any]] = None

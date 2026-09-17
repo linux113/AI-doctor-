@@ -38,7 +38,20 @@ from typing import Any, Dict
 
 import pytest
 
-from runner.doctor_runner import DoctorRunner
+from runner.doctor_runner import (
+    STAGE_AI_DIAGNOSIS,
+    STAGE_CODES,
+    STAGE_DETECTED,
+    STAGE_EVIDENCE_COLLECTED,
+    STAGE_FAILED,
+    STAGE_POLICY_CHECK,
+    STAGE_RECOVERED,
+    STAGE_REMEDIATION_STARTED,
+    STAGE_RETRY,
+    STAGE_VERIFICATION,
+    TIMELINE_STAGE_CODES,
+    DoctorRunner,
+)
 from runner.ollama_runtime import OLLAMA_NOT_INSTALLED, OLLAMA_RUNNING, OLLAMA_STOPPED
 from runner.redaction import sanitize_deep
 from runner.remediation_registry import REMEDIATION_ALLOWLIST
@@ -364,6 +377,137 @@ def test_the_offline_record_serialises_for_the_api(no_aws, full_loop, monkeypatc
     encoded = json.dumps(result, default=str)
     assert encoded
     assert json.loads(encoded)["status"] == result["status"]
+
+
+# =========================================================================
+# The timeline: required vocabulary, in order, with nothing invented
+# =========================================================================
+
+
+@pytest.fixture
+def offline_result(no_aws, full_loop, monkeypatch):
+    """One real offline run, shared by the timeline assertions."""
+    monkeypatch.setenv("AI_DOCTOR_AGENT_MODE", "deterministic")
+    return DoctorRunner().heal_incident(dict(INCIDENT))
+
+
+def test_every_timeline_entry_carries_a_stage_code_from_the_required_vocabulary(offline_result):
+    """
+    A consumer must be able to branch on a stable identifier rather than parse a
+    display string, so every entry carries both - and the two cannot drift,
+    because one helper emits them together.
+    """
+    timeline = offline_result["timeline"]
+    assert timeline, "the loop produced no timeline at all"
+    for entry in timeline:
+        assert entry.get("stage_code") in TIMELINE_STAGE_CODES, entry
+        assert entry.get("stage"), entry
+        assert STAGE_CODES[entry["stage"]] == entry["stage_code"], (
+            f"the display string and the code disagree: {entry['stage']!r} vs {entry['stage_code']!r}"
+        )
+
+
+def test_the_stages_appear_in_the_pipeline_order(offline_result):
+    """
+    DETECTED -> EVIDENCE_COLLECTED -> AI_DIAGNOSIS -> POLICY_CHECK ->
+    REMEDIATION_STARTED -> VERIFICATION -> (RETRY) -> RECOVERED or FAILED.
+
+    RETRY is optional: it appears only when a captured request was really
+    replayed. Everything else is mandatory, and the order is what makes the
+    timeline readable as a causal sequence.
+    """
+    codes = [entry["stage_code"] for entry in offline_result["timeline"]]
+    required = [
+        STAGE_DETECTED,
+        STAGE_EVIDENCE_COLLECTED,
+        STAGE_AI_DIAGNOSIS,
+        STAGE_POLICY_CHECK,
+        STAGE_REMEDIATION_STARTED,
+        STAGE_VERIFICATION,
+    ]
+    positions = []
+    for code in required:
+        assert code in codes, f"{code} is missing from {codes}"
+        positions.append(codes.index(code))
+    assert positions == sorted(positions), f"stages are out of order: {codes}"
+    assert codes[0] == STAGE_DETECTED
+    assert codes[-1] in (STAGE_RECOVERED, STAGE_FAILED)
+    # A terminal stage appears exactly once, at the end.
+    assert codes.count(STAGE_RECOVERED) + codes.count(STAGE_FAILED) == 1
+
+
+def test_the_retry_stage_appears_only_when_a_request_was_really_replayed(offline_result):
+    """
+    A stage that did not happen must not appear. Here the remediation itself
+    failed, so nothing was replayed - and the timeline must not imply otherwise.
+    """
+    codes = [entry["stage_code"] for entry in offline_result["timeline"]]
+    replayed = isinstance(offline_result.get("retry_result"), dict)
+    assert (STAGE_RETRY in codes) == replayed, (
+        f"RETRY present={STAGE_RETRY in codes} but retry_result present={replayed}"
+    )
+
+
+def test_the_ai_diagnosis_stage_states_which_engine_answered(offline_result):
+    """
+    Requirement: AI_DIAGNOSIS shows the agent mode, the model, the confidence, the
+    evidence it relied on and the recommended action - so a reader can tell a
+    model diagnosis from a rule-engine one without opening any other field.
+    """
+    entry = next(e for e in offline_result["timeline"] if e["stage_code"] == STAGE_AI_DIAGNOSIS)
+    summary = entry["details"]["ai_diagnosis"]
+
+    for key in ("agent_mode", "agent_status", "diagnosis_outcome", "used_llm",
+                "bedrock_invoked", "model_id", "aws_region", "confidence",
+                "evidence_ids", "recommended_action", "requires_human"):
+        assert key in summary, f"AI_DIAGNOSIS is missing {key}"
+
+    assert summary["agent_mode"] == "deterministic"
+    assert summary["used_llm"] is False
+    assert summary["bedrock_invoked"] is False
+    assert summary["model_id"] is None, "an offline run must not name a model"
+    assert summary["recommended_action"] in (set(REMEDIATION_ALLOWLIST) | {"none"})
+    # The offline engine has no evidence catalogue, so its probe names are the
+    # linkage - and the entry must carry one or the other, never neither.
+    assert summary["evidence_ids"] or summary["corroborating_probes"]
+    # The description names the engine too, since that is what a reader sees first.
+    assert "deterministic offline rule engine" in entry["description"]
+    assert "Amazon Bedrock model" not in entry["description"]
+
+
+def test_the_policy_check_is_its_own_visible_stage(offline_result):
+    """
+    The gate between a recommendation and an execution is the boundary a security
+    reviewer needs to see, so it is a stage rather than a detail buried inside
+    another one.
+    """
+    entry = next(e for e in offline_result["timeline"] if e["stage_code"] == STAGE_POLICY_CHECK)
+    assert entry["details"], "the policy stage records nothing"
+    # Deterministic mode produces no model recommendation to gate; the entry says
+    # so and points at the layer that does enforce the allowlist.
+    assert entry["details"]["layer"] == "remediation_allowlist"
+    assert entry["details"]["requested_action"] == offline_result["action_taken"]
+    assert entry["details"]["allowlisted"] is (
+        offline_result["action_taken"] in REMEDIATION_ALLOWLIST
+    )
+
+
+def test_no_timeline_entry_contains_a_secret_or_a_raw_prompt(offline_result):
+    """
+    The timeline is persisted and rendered. It must carry conclusions, never the
+    prompt that produced them and never credential material.
+    """
+    blob = str(offline_result["timeline"])
+    for forbidden in (
+        "You are the diagnosis agent for AI Doctor",   # the system prompt
+        "===END-OF-UNTRUSTED-EVIDENCE===",             # the evidence fence
+        "AKIA",
+        "AWS_SECRET_ACCESS_KEY=",
+        "Authorization: Bearer",
+        "password=",
+        "api_key=",
+    ):
+        assert forbidden not in blob, f"the timeline contains {forbidden!r}"
 
 
 def test_nothing_in_this_file_imports_the_fake_bedrock_transport():

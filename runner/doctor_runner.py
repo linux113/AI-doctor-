@@ -16,6 +16,46 @@ from .diagnosis import diagnose
 from .ollama_runtime import OLLAMA_NOT_INSTALLED, OLLAMA_RUNNING, OLLAMA_UNHEALTHY
 
 
+# The pipeline stage vocabulary. `heal_incident` emits a human-readable `stage`
+# for display and one of these codes as `stage_code`, so a consumer can branch on
+# a stable identifier instead of parsing prose.
+STAGE_DETECTED = "DETECTED"
+STAGE_EVIDENCE_COLLECTED = "EVIDENCE_COLLECTED"
+STAGE_AI_DIAGNOSIS = "AI_DIAGNOSIS"
+STAGE_POLICY_CHECK = "POLICY_CHECK"
+STAGE_REMEDIATION_STARTED = "REMEDIATION_STARTED"
+STAGE_VERIFICATION = "VERIFICATION"
+STAGE_RETRY = "RETRY"
+STAGE_RECOVERED = "RECOVERED"
+STAGE_FAILED = "FAILED"
+
+TIMELINE_STAGE_CODES = (
+    STAGE_DETECTED,
+    STAGE_EVIDENCE_COLLECTED,
+    STAGE_AI_DIAGNOSIS,
+    STAGE_POLICY_CHECK,
+    STAGE_REMEDIATION_STARTED,
+    STAGE_VERIFICATION,
+    STAGE_RETRY,
+    STAGE_RECOVERED,
+    STAGE_FAILED,
+)
+
+# Display string -> code. Kept as a table so the two can never drift, and so a
+# missing mapping is a loud KeyError rather than a silently uncoded entry.
+STAGE_CODES = {
+    "DETECTED": STAGE_DETECTED,
+    "INVESTIGATING": STAGE_EVIDENCE_COLLECTED,
+    "ROOT CAUSE FOUND": STAGE_AI_DIAGNOSIS,
+    "POLICY CHECK": STAGE_POLICY_CHECK,
+    "REMEDIATION": STAGE_REMEDIATION_STARTED,
+    "VERIFYING": STAGE_VERIFICATION,
+    "RETRY": STAGE_RETRY,
+    "RESOLVED": STAGE_RECOVERED,
+    "FAILED": STAGE_FAILED,
+}
+
+
 class DoctorRunner:
     """Orchestrates autonomous failure detection, evidence collection, and remediation."""
 
@@ -295,12 +335,40 @@ class DoctorRunner:
             or "Unknown error"
         )
 
+        def add_stage(stage: str, description: str, **extra: Any) -> None:
+            """
+            Appends one timeline entry with its machine-readable code.
+
+            Every entry goes through here, so an entry without a `stage_code`
+            cannot be produced and the display string and the code cannot drift.
+            """
+            entry = {
+                "stage": stage,
+                "stage_code": STAGE_CODES[stage],
+                "timestamp": now(),
+                "description": description,
+            }
+            entry.update(extra)
+            timeline.append(entry)
+
         # 1. DETECTED
-        timeline.append({"stage": "DETECTED", "timestamp": now(), "description": "Failure detected: " + detected_error})
+        add_stage("DETECTED", "Failure detected: " + detected_error)
 
         # 2. INVESTIGATING
-        timeline.append({"stage": "INVESTIGATING", "timestamp": now(), "description": "Collecting system evidence via diagnostic tools"})
         evidence = self.collect_evidence()
+        # EVIDENCE_COLLECTED: appended after collection so the entry can state
+        # what was actually gathered rather than only announcing an intention.
+        add_stage(
+            "INVESTIGATING",
+            "Collecting system evidence via diagnostic tools",
+            details={
+                "runtime_state": (evidence.get("runtime") or {}).get("state"),
+                "port_open": (evidence.get("port_11434") or {}).get("is_open"),
+                "process_running": (evidence.get("process_ollama") or {}).get("is_running"),
+                "api_available": (evidence.get("ollama_api") or {}).get("is_available"),
+                "log_lines": len(evidence.get("recent_logs") or []),
+            },
+        )
 
         # 3. ROOT CAUSE FOUND
         # Which engine answered is decided by AI_DOCTOR_AGENT_MODE and recorded
@@ -311,17 +379,90 @@ class DoctorRunner:
         )
         agent_mode = diagnosis.get("agent_mode") or "deterministic"
         agent_status = diagnosis.get("agent_status")
-        engine_label = (
-            f"Amazon Bedrock model {diagnosis.get('agent_telemetry', {}).get('model_id')}"
-            if agent_mode == "bedrock"
-            else "deterministic offline rule engine"
+        diagnosis_outcome = diagnosis.get("diagnosis_outcome")
+        # The label follows what actually produced the answer, not what was
+        # configured. Naming a Bedrock model here when the round trip failed - or
+        # when the model answered in an unusable shape - is the exact false claim
+        # this timeline exists to prevent.
+        if diagnosis.get("used_llm"):
+            engine_label = (
+                f"Amazon Bedrock model {(diagnosis.get('agent_telemetry') or {}).get('model_id')}"
+            )
+        elif agent_mode == "bedrock":
+            engine_label = (
+                "Amazon Bedrock was requested but produced no diagnosis"
+                if diagnosis_outcome == "FAILED"
+                else "Amazon Bedrock answered but returned no usable diagnosis"
+            )
+        else:
+            engine_label = "deterministic offline rule engine"
+
+        telemetry = diagnosis.get("agent_telemetry") or {}
+        # AI_DIAGNOSIS shows which engine answered, which model, how confident it
+        # was, which evidence supported it and what it recommended. No prompt text
+        # and no secret material: the report is already sanitised at the boundary.
+        ai_diagnosis = {
+            "agent_mode": agent_mode,
+            "agent_status": agent_status,
+            "diagnosis_outcome": diagnosis_outcome,
+            "used_llm": bool(diagnosis.get("used_llm")),
+            "bedrock_invoked": bool(diagnosis.get("bedrock_invoked")),
+            "model_id": telemetry.get("model_id"),
+            "aws_region": telemetry.get("aws_region"),
+            "confidence": diagnosis.get("confidence"),
+            # The agent path cites catalogued evidence IDs; the offline engine has
+            # no catalogue, so its probe names are the equivalent linkage.
+            "evidence_ids": list(diagnosis.get("evidence_ids") or []),
+            "corroborating_probes": list(diagnosis.get("corroborating_probes") or []),
+            "recommended_action": diagnosis.get("recommended_remediation"),
+            "requires_human": bool(diagnosis.get("requires_human")),
+        }
+        add_stage(
+            "ROOT CAUSE FOUND",
+            f"[{engine_label}] {diagnosis['root_cause']}",
+            details={**diagnosis, "ai_diagnosis": ai_diagnosis},
         )
-        timeline.append({
-            "stage": "ROOT CAUSE FOUND",
-            "timestamp": now(),
-            "description": f"[{engine_label}] {diagnosis['root_cause']}",
-            "details": diagnosis,
-        })
+
+        # POLICY_CHECK: the gate between a recommendation and an execution. It is
+        # its own stage because it is the boundary a reviewer needs to see - what
+        # was asked for, what was approved, and why anything was refused.
+        policy_event = diagnosis.get("policy_decision")
+        if policy_event:
+            approved = bool(policy_event.get("allowed"))
+            add_stage(
+                "POLICY CHECK",
+                (
+                    f"Policy gate {'ALLOWED' if approved else 'BLOCKED'} "
+                    f"{policy_event.get('requested_action')!r}"
+                    + (
+                        f" -> approved {policy_event.get('approved_action')!r}"
+                        if approved and policy_event.get("approved_action")
+                        else ""
+                    )
+                    + (
+                        f" ({policy_event.get('violation')})"
+                        if policy_event.get("violation")
+                        else ""
+                    )
+                ),
+                details=policy_event,
+            )
+        else:
+            # Deterministic mode produces no model recommendation to gate, but the
+            # allowlist is still enforced - by the registry, before anything runs.
+            # Saying so is better than omitting the stage and leaving a reader to
+            # assume no gate exists.
+            action = diagnosis.get("recommended_remediation")
+            add_stage(
+                "POLICY CHECK",
+                "No model recommendation to gate. The remediation allowlist is "
+                f"enforced by the registry before any action runs (requested: {action!r}).",
+                details={
+                    "layer": "remediation_allowlist",
+                    "requested_action": action,
+                    "allowlisted": self.remediation_registry.is_allowed(action or ""),
+                },
+            )
 
         # 4. REMEDIATION
         remediation_action = diagnosis["recommended_remediation"]
@@ -346,8 +487,9 @@ class DoctorRunner:
         failed_stage = recovery_outcome.get("stage")
         fix_succeeded = failed_stage != "FIX"
 
-        timeline.append({
+        remediation_entry = {
             "stage": "REMEDIATION",
+            "stage_code": STAGE_CODES["REMEDIATION"],
             "timestamp": remediation_started_at,
             "description": (
                 f"Executing allowlisted action: {remediation_action}"
@@ -362,10 +504,12 @@ class DoctorRunner:
                 "audit_entries": len(audit_log),
                 "error": None if fix_succeeded else recovery_outcome.get("error"),
             },
-        })
+        }
+        timeline.append(remediation_entry)
 
-        timeline.append({
+        verification_entry = {
             "stage": "VERIFYING",
+            "stage_code": STAGE_CODES["VERIFYING"],
             "timestamp": now(),
             "description": (
                 "Verifying port 11434 and Ollama HTTP endpoint availability"
@@ -374,7 +518,33 @@ class DoctorRunner:
             ),
             "verified": recovery_outcome["success"],
             "details": recovery_outcome.get("verification") if fix_succeeded else None,
-        })
+        }
+        timeline.append(verification_entry)
+
+        # RETRY: emitted only when a captured request was actually replayed. A
+        # stage that did not happen must not appear in the timeline - the absence
+        # is itself information, and the RESOLVED description states it plainly.
+        retry_result = recovery_outcome.get("retry_result")
+        if isinstance(retry_result, dict):
+            retry_ok = bool(retry_result.get("success"))
+            add_stage(
+                "RETRY",
+                (
+                    "The original request was replayed and succeeded "
+                    f"({retry_result.get('status_code')})"
+                    if retry_ok
+                    else "The original request was replayed and did NOT succeed: "
+                    f"{retry_result.get('error') or retry_result.get('status_code') or 'unknown'}"
+                ),
+                verified=retry_ok,
+                details={
+                    "url": retry_result.get("url"),
+                    "method": retry_result.get("method"),
+                    "status_code": retry_result.get("status_code"),
+                    "success": retry_ok,
+                    "error": retry_result.get("error"),
+                },
+            )
 
         # 6. RESOLVED / FAILED
         if recovery_outcome["success"]:
@@ -390,22 +560,20 @@ class DoctorRunner:
                     "Service health was restored, but the replayed request did not succeed "
                     f"({retry_result.get('error') or retry_result.get('status_code')})."
                 )
-            timeline.append({
-                "stage": "RESOLVED",
-                "timestamp": now(),
-                "description": f"All services healthy. {replay_note}",
-                "details": {"retry_succeeded": retry_ok, "request_replayed": retried},
-            })
+            add_stage(
+                "RESOLVED",
+                f"All services healthy. {replay_note}",
+                verified=True,
+                details={"retry_succeeded": retry_ok, "request_replayed": retried},
+            )
             final_status = "RESOLVED"
         else:
-            timeline.append({
-                "stage": "FAILED",
-                "timestamp": now(),
-                "description": (
-                    f"Recovery failed at the {failed_stage} stage: {recovery_outcome.get('error')}"
-                ),
-                "details": {"failed_stage": failed_stage},
-            })
+            add_stage(
+                "FAILED",
+                f"Recovery failed at the {failed_stage} stage: {recovery_outcome.get('error')}",
+                verified=False,
+                details={"failed_stage": failed_stage},
+            )
             final_status = "FAILED"
 
         return {
