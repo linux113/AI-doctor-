@@ -1,0 +1,6 @@
+# DeepTeam LLM Red Teaming Framework
+git+https://github.com/confident-ai/deepteam.git
+sentry-sdk>=2.0.0
+opentelemetry-exporter-otlp-proto-grpc>=1.24.0
+fastapi>=0.110.0
+uvicorn>=0.28.0

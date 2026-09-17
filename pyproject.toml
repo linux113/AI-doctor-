@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-doctor"
+version = "0.1.0"
+description = "AI Doctor triage assistant integrated with DeepTeam LLM red teaming and safety guardrails"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "deepteam",
+    "deepeval",
+    "sentry-sdk>=2.0.0",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.24.0",
+    "openai>=1.0.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

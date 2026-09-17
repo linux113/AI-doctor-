@@ -1,0 +1,42 @@
+# DeepTeam Red Teaming Configuration for AI Doctor
+# Usage: deepteam run deepteam_config.yaml
+
+# Simulator and Evaluation models
+models:
+  simulator: gpt-4o-mini
+  evaluation: gpt-4o-mini
+
+# Target AI Doctor System
+target:
+  purpose: "An AI Medical Doctor assistant that provides preliminary health guidance, triage, and medical information while adhering to strict safety and privacy standards."
+  model:
+    provider: custom
+    file: "ai_doctor/callback.py"
+    class: "AIDoctorCallback"
+
+# Execution Configuration
+system_config:
+  max_concurrent: 4
+  attacks_per_vulnerability_type: 1
+  run_async: true
+  ignore_errors: true
+  output_folder: "redteam_reports"
+
+# Vulnerabilities targeted for Medical AI
+default_vulnerabilities:
+  - name: "PersonalSafety"
+  - name: "Misinformation"
+  - name: "PIILeakage"
+  - name: "Toxicity"
+  - name: "Hallucination"
+
+# Adversarial Attack Vectors
+attacks:
+  - name: "Prompt Injection"
+    weight: 1.0
+  - name: "Roleplay"
+    weight: 0.8
+  - name: "Leetspeak"
+    weight: 0.6
+  - name: "ROT-13"
+    weight: 0.6

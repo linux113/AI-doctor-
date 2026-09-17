@@ -1,0 +1,33 @@
+{
+  "TableName": "AIDoctorIncidents",
+  "KeySchema": [
+    { "AttributeName": "incident_id", "KeyType": "HASH" },
+    { "AttributeName": "created_at", "KeyType": "RANGE" }
+  ],
+  "AttributeDefinitions": [
+    { "AttributeName": "incident_id", "AttributeType": "S" },
+    { "AttributeName": "created_at", "AttributeType": "S" },
+    { "AttributeName": "status", "AttributeType": "S" }
+  ],
+  "GlobalSecondaryIndexes": [
+    {
+      "IndexName": "StatusCreatedAtIndex",
+      "KeySchema": [
+        { "AttributeName": "status", "KeyType": "HASH" },
+        { "AttributeName": "created_at", "KeyType": "RANGE" }
+      ],
+      "Projection": {
+        "ProjectionType": "ALL"
+      },
+      "ProvisionedThroughput": {
+        "ReadCapacityUnits": 5,
+        "WriteCapacityUnits": 5
+      }
+    }
+  ],
+  "BillingMode": "PROVISIONED",
+  "ProvisionedThroughput": {
+    "ReadCapacityUnits": 5,
+    "WriteCapacityUnits": 5
+  }
+}

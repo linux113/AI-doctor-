@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.deepeval/
+.deepteam/
+.env
+redteam_reports/
+results/
+node_modules/
+frontend/node_modules/
+frontend/.next/
+.next/
+*.pid
+

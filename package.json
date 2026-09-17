@@ -1,0 +1,9 @@
+{
+  "name": "ai-doctor",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AI Doctor healthcare triage assistant with DeepTeam red teaming and safety guardrails",
+  "dependencies": {
+    "framer-motion": "^12.43.0"
+  }
+}
