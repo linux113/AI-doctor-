@@ -7,3 +7,4 @@ __pycache__/
 .env
 redteam_reports/
 results/
+node_modules/
