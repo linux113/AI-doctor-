@@ -150,9 +150,90 @@ def test_no_secret_reaches_the_bedrock_request_payload():
     assert_no_secret(str(outcome.telemetry.as_dict()), "agent telemetry")
 
 
+# The six literal strings named in the redaction requirement, verbatim. Each must
+# be impossible to send to Bedrock, and each must leave a marker behind so an
+# operator can still see that something was removed.
+REQUIREMENT_STRINGS = (
+    "Authorization: Bearer SECRET",
+    "api_key=SECRET",
+    "password=SECRET",
+    "AWS_ACCESS_KEY_ID=SECRET",
+    "AWS_SECRET_ACCESS_KEY=SECRET",
+    "token=SECRET",
+)
+
+
+def test_all_six_requirement_strings_cannot_reach_the_bedrock_request():
+    """
+    The requirement's end state, asserted at the wire.
+
+    All six named literals are embedded in every shape real evidence takes -
+    nested dicts, lists, an exception object, HTTP headers, log lines and the
+    environment dump - and the REAL agent stack is run (real `strands.Agent`,
+    real `BedrockModel`, real request construction; only `client.converse` is
+    answered locally). What is then searched is the exact payload that would have
+    been transmitted to Amazon Bedrock.
+
+    This is the test that matters: a redactor that works on a string in isolation
+    proves nothing about what the model actually receives.
+    """
+    evidence = poisoned_evidence()
+    incident = poisoned_incident()
+
+    # Every one of the six, in the containers evidence really arrives in.
+    evidence["runtime"]["environment"].update({
+        "captured_body": '{"AWS_ACCESS_KEY_ID": "SECRET", "token": "SECRET"}',
+        "startup_error": RuntimeError(
+            "ollama exited: Authorization: Bearer SECRET rejected, api_key=SECRET"
+        ),
+        "env_dump": [
+            "AWS_ACCESS_KEY_ID=SECRET",
+            "AWS_SECRET_ACCESS_KEY=SECRET",
+            "token=SECRET",
+        ],
+    })
+    evidence["recent_logs"].extend([
+        {"level": "ERROR", "message": "header was Authorization: Bearer SECRET", "service": "demo"},
+        {"level": "ERROR", "message": "config api_key=SECRET password=SECRET", "service": "demo"},
+        {"level": "WARN", "message": '{"token": "SECRET"}', "service": "demo"},
+    ])
+    incident["request_context"]["headers"]["x-captured"] = "AWS_ACCESS_KEY_ID=SECRET"
+    incident["request_context"]["payload"]["nested"] = {"deep": [{"token": "SECRET"}]}
+    incident["error_detail"] += "; token=SECRET; AWS_ACCESS_KEY_ID=SECRET"
+
+    transport = FakeBedrockTransport(fields=dict(WELL_FORMED_REPLY))
+    agent = make_transport_agent(bedrock_config(), transport)
+    outcome = agent.diagnose(incident, evidence, BASELINE, "inc-six-strings")
+
+    assert transport.calls, "the model was never called, so nothing was proven"
+    payload = transport.payload_json()
+    assert payload, "no request payload was recorded"
+
+    for literal in REQUIREMENT_STRINGS:
+        assert literal not in payload, (
+            f"{literal!r} reached the Bedrock request payload:\n{payload[:1200]}"
+        )
+        # Checked in each part of the request too, so a failure names the leak.
+        assert literal not in transport.system_prompt(), f"{literal!r} in the system prompt"
+        assert literal not in transport.user_prompt(), f"{literal!r} in the user prompt"
+        assert literal not in str(transport.last_request["messages"]), (
+            f"{literal!r} in the message history"
+        )
+        assert literal not in str(transport.last_request.get("toolConfig")), (
+            f"{literal!r} in the tool config"
+        )
+
+    # The distinctive values from the nested fixtures must be gone as well.
+    assert_no_secret(payload, "Bedrock request payload")
+    assert_no_secret(str(outcome.report), "diagnosis report")
+    assert_no_secret(str(outcome.telemetry.as_dict()), "telemetry")
+    # And redaction demonstrably happened, rather than the evidence being dropped.
+    assert "[REDACTED" in payload, "no redaction marker in the payload - was it applied at all?"
+
+
 def test_the_exact_requirement_strings_are_redacted():
     """
-    The requirement names four literal strings. Each is asserted individually,
+    The requirement names six literal strings. Each is asserted individually,
     including that the surrounding key name survives (an operator still needs to
     know *which* credential was removed) while the value does not.
     """
@@ -170,7 +251,99 @@ def test_the_exact_requirement_strings_are_redacted():
     assert sanitize_deep("Authorization: Bearer SECRET") == "Authorization: [REDACTED_HEADER]"
     assert sanitize_deep("api_key=SECRET") == "api_key=[REDACTED_KEY]"
     assert sanitize_deep("password=SECRET") == "password=[REDACTED_PASSWORD]"
+    assert sanitize_deep("AWS_ACCESS_KEY_ID=SECRET") == "AWS_ACCESS_KEY_ID=[REDACTED_KEY]"
     assert sanitize_deep("AWS_SECRET_ACCESS_KEY=SECRET") == "AWS_SECRET_ACCESS_KEY=[REDACTED_KEY]"
+    assert sanitize_deep("token=SECRET") == "token=[REDACTED_TOKEN]"
+
+
+@pytest.mark.parametrize("literal", REQUIREMENT_STRINGS)
+def test_every_requirement_string_is_redacted_in_every_container(literal):
+    """
+    The same literal, placed in each container shape evidence actually arrives in:
+    a bare string, a nested dict, a list, a dict used as a KEY, an exception
+    message, an HTTP header value and a log line.
+
+    Redaction that only works at the top level is redaction that fails in
+    production, because evidence is always nested.
+    """
+    value = literal.split()[-1] if " " in literal else literal
+    containers = {
+        "bare string": literal,
+        "nested dict": {"runtime": {"environment": {"dump": literal}}},
+        "list": [{"level": "ERROR", "message": literal}],
+        "dict key": {literal: "some value"},
+        "exception message": RuntimeError(literal),
+        "exception in a dict": {"last_error": ValueError(f"call failed: {literal}")},
+        "header value": {"headers": {"x-captured": literal}},
+        "deep nesting": {"a": {"b": [{"c": {"d": [literal]}}]}},
+    }
+    for where, container in containers.items():
+        cleaned = sanitize_deep(container)
+        blob = str(cleaned)
+        assert literal not in blob, f"{where}: {literal!r} survived -> {blob!r}"
+        assert "[REDACTED" in blob, f"{where}: nothing was redacted -> {blob!r}"
+        # The credential VALUE itself must be gone, not merely the key.
+        if value and value != literal:
+            assert value not in blob, f"{where}: value {value!r} survived -> {blob!r}"
+
+
+def test_serialised_json_credentials_are_redacted_not_just_key_value_pairs():
+    """
+    Regression. Every key/value rule required the key name to be followed
+    directly by ":" or "=", so a credential inside a SERIALIZED JSON document -
+    a captured request body, an environment dump, an exception payload, a log
+    line - survived untouched and would have been sent to the model. The quoted
+    key form ("password": "hunter2") is the shape real evidence actually has.
+    """
+    documents = [
+        '{"AWS_ACCESS_KEY_ID": "SECRET"}',
+        '{"aws_secret_access_key": "wJalrXUtnFEMI-DoNotLeak"}',
+        '{"password": "hunter2-DoNotLeak"}',
+        '{"api_key": "sk-DoNotLeak"}',
+        '{"token": "tok-DoNotLeak"}',
+        '{"session_id": "SessValue-DoNotLeak"}',
+        '{"authorization": "AuthValue-DoNotLeak"}',
+        '{"headers": {"x-api-key": "ApiKeyValue-DoNotLeak"}}',
+        'captured body: {"prompt":"hi","password":"PassValue-DoNotLeak"}',
+    ]
+    for document in documents:
+        cleaned = str(sanitize_deep(document))
+        assert "DoNotLeak" not in cleaned, f"{document!r} -> {cleaned!r}"
+        assert "[REDACTED" in cleaned, f"{document!r} -> {cleaned!r}"
+        # Idempotent: re-sanitising a marker must not double-redact.
+        assert sanitize_deep(cleaned) == cleaned
+
+
+def test_an_exception_object_nested_in_evidence_cannot_leak():
+    """
+    Regression. `sanitize_deep` used to return any non-primitive untouched on the
+    assumption that the only such values were ints and None. An exception raised
+    by a failed HTTP call embeds the credentials it was given, so an exception
+    sitting inside the evidence bundle reached the model verbatim once the bundle
+    was serialised. Scalars must keep their type; everything else becomes
+    redacted text.
+    """
+    exc = RuntimeError("connection refused with password=SECRET and token=SECRET")
+    cleaned = sanitize_deep({"ollama_api": {"last_error": exc}})
+    blob = str(cleaned)
+    assert "password=SECRET" not in blob and "token=SECRET" not in blob
+    assert "[REDACTED_PASSWORD]" in blob and "[REDACTED_TOKEN]" in blob
+
+    # Scalars are preserved, so counters and JSON shapes do not change type.
+    for value in (None, True, False, 0, 42, 3.5):
+        out = sanitize_deep({"k": value})["k"]
+        assert out is value or out == value, value
+        assert type(out) is type(value), f"{value!r} became {type(out).__name__}"
+
+    # A hostile __str__ must not crash redaction, and must not pass through.
+    class Unrenderable:
+        def __str__(self):
+            raise ValueError("no")
+
+        def __repr__(self):
+            raise ValueError("no")
+
+    assert sanitize_deep(Unrenderable()) == "[REDACTED_UNRENDERABLE_OBJECT]"
 
 
 def test_short_bearer_credentials_are_redacted_not_just_long_ones():

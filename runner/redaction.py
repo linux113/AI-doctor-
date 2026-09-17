@@ -113,6 +113,15 @@ CREDENTIAL_PATTERNS = [
     (re.compile(r"(sk-[a-zA-Z0-9]{20,})", re.IGNORECASE), "[REDACTED_API_KEY]"),
 
     # --- Header and key/value forms --------------------------------------
+    #
+    # Every rule below tolerates an optional quote between the key name and the
+    # ":" or "=" separator. Serialized JSON is the common case - a captured
+    # request body, an environment dump, an exception payload or a log line reads
+    # "password": "hunter2", and without that tolerance the value survived
+    # redaction entirely and would have been sent to the model.
+    #
+    # The value class deliberately cannot match "[", which is what keeps repeated
+    # sanitisation idempotent: "[REDACTED_KEY]" never re-fires.
     # Short bearer credentials. The long-form rule below only fires at 20+
     # characters, which left an 18-character token such as
     # "Bearer SECRET-TOKEN-VALUE" exposed. Short tokens are redacted only when
@@ -129,14 +138,14 @@ CREDENTIAL_PATTERNS = [
     (re.compile(r"(Basic\s+)[A-Za-z0-9+/=_\-]{16,}"), r"\1[REDACTED_TOKEN]"),
     # Connection-string credentials, e.g. postgres://user:hunter2@host
     (re.compile(r"(://[^/\s:@]+:)[^@\s/]+(@)"), r"\1[REDACTED_PASSWORD]\2"),
-    (re.compile(r"(x-api-key\s*[:=]\s*['\"]?)[^\s'\",}]+(['\"]?)", re.IGNORECASE), r"\1[REDACTED_KEY]\2"),
+    (re.compile(r"(x-api-key['\"]?\s*[:=]\s*['\"]?)[^\s'\",}]+(['\"]?)", re.IGNORECASE), r"\1[REDACTED_KEY]\2"),
     # An Authorization value may carry an authentication scheme, i.e.
     # "Authorization: Bearer <credential>". The scheme word and the credential
     # are consumed together: matching only up to the first space redacted the
     # word "Bearer" and left the secret itself in the string.
     (
         re.compile(
-            r"(authorization\s*[:=]\s*['\"]?)(?:(?:bearer|basic|token|digest)\s+)?[^\s'\",}]*(['\"]?)",
+            r"(authorization['\"]?\s*[:=]\s*['\"]?)(?:(?:bearer|basic|token|digest)\s+)?[^\s'\",}]*(['\"]?)",
             re.IGNORECASE,
         ),
         r"\1[REDACTED_HEADER]\2",
@@ -146,20 +155,20 @@ CREDENTIAL_PATTERNS = [
     # "api_key=None" costs an operator almost nothing; leaking a short key costs
     # everything, so the threshold errs towards redaction. The value class cannot
     # match "[", which keeps repeated sanitisation idempotent.
-    (re.compile(r"(api[_-]?key\s*[:=]\s*['\"]?)[a-zA-Z0-9_\-]{4,}(['\"]?)", re.IGNORECASE), r"\1[REDACTED_KEY]\2"),
+    (re.compile(r"(api[_-]?key['\"]?\s*[:=]\s*['\"]?)[a-zA-Z0-9_\-]{4,}(['\"]?)", re.IGNORECASE), r"\1[REDACTED_KEY]\2"),
     # AWS_ACCESS_KEY_ID=... / aws_secret_access_key=... / access_key_id: ...
     (
         re.compile(
             r"(aws[_-]?(?:access[_-]?key[_-]?id|secret[_-]?access[_-]?key)|access[_-]?key(?:[_-]?id)?|secret[_-]?access[_-]?key)"
-            r"(\s*[:=]\s*['\"]?)[^\s'\",}]+(['\"]?)",
+            r"(['\"]?\s*[:=]\s*['\"]?)[^\s'\",}]+(['\"]?)",
             re.IGNORECASE,
         ),
         r"\1\2[REDACTED_KEY]\3",
     ),
-    (re.compile(r"(password|passwd|pwd)(\s*[:=]\s*['\"]?)[^\s'\",}]+(['\"]?)", re.IGNORECASE), r"\1\2[REDACTED_PASSWORD]\3"),
-    (re.compile(r"(secret(?:[_-]?key)?)(\s*[:=]\s*['\"]?)[^\s'\",}]+(['\"]?)", re.IGNORECASE), r"\1\2[REDACTED_SECRET]\3"),
-    (re.compile(r"(token)(\s*[:=]\s*['\"]?)[^\s'\",}]+(['\"]?)", re.IGNORECASE), r"\1\2[REDACTED_TOKEN]\3"),
-    (re.compile(r"(session[_-]?id|cookie)(\s*[:=]\s*['\"]?)[^\s'\",}]+(['\"]?)", re.IGNORECASE), r"\1\2[REDACTED_SESSION]\3"),
+    (re.compile(r"(password|passwd|pwd)(['\"]?\s*[:=]\s*['\"]?)[^\s'\",}]+(['\"]?)", re.IGNORECASE), r"\1\2[REDACTED_PASSWORD]\3"),
+    (re.compile(r"(secret(?:[_-]?key)?)(['\"]?\s*[:=]\s*['\"]?)[^\s'\",}]+(['\"]?)", re.IGNORECASE), r"\1\2[REDACTED_SECRET]\3"),
+    (re.compile(r"(token)(['\"]?\s*[:=]\s*['\"]?)[^\s'\",}]+(['\"]?)", re.IGNORECASE), r"\1\2[REDACTED_TOKEN]\3"),
+    (re.compile(r"(session[_-]?id|cookie)(['\"]?\s*[:=]\s*['\"]?)[^\s'\",}]+(['\"]?)", re.IGNORECASE), r"\1\2[REDACTED_SESSION]\3"),
 ]
 
 
@@ -186,10 +195,20 @@ def sanitize_deep(obj: Any, _depth: int = 0, _budget: Optional[int] = None) -> A
     """
     Recursively redacts every string reachable from a JSON-shaped structure.
 
-    Handles dict, list, tuple, set and str; every other type is returned as-is
-    (ints, bools, None, floats carry no secret surface). Depth and total-item
-    caps prevent a malicious or corrupt payload from causing unbounded
-    recursion.
+    Handles dict, list, tuple, set and str. Scalars (int, float, bool, None) are
+    returned as-is: they carry no secret surface, and preserving their type keeps
+    counters and JSON shapes intact.
+
+    Anything else - an exception, a datetime, an arbitrary object - is reduced to
+    its redacted text. That is not a cosmetic choice: an exception raised by a
+    failed HTTP call routinely embeds the headers or credentials it was given, and
+    while such an exception sat inside the evidence bundle it was returned
+    untouched and its message reached the model verbatim when the bundle was
+    serialised. Text is the only part of an unknown object that can carry
+    meaning, so text is the part that gets redacted.
+
+    Depth and total-item caps prevent a malicious or corrupt payload from causing
+    unbounded recursion.
 
     Returns a NEW structure; the input is never mutated in place, so callers
     cannot accidentally keep a reference to the unsanitised original.
@@ -231,4 +250,26 @@ def sanitize_deep(obj: Any, _depth: int = 0, _budget: Optional[int] = None) -> A
         items = {sanitize_deep(v, _depth + 1, _budget) for v in obj if _budget[0] > 0}
         return type(obj)(items)
 
-    return obj
+    if obj is None or isinstance(obj, (bool, int, float)):
+        return obj
+
+    _budget[0] -= 1
+    return redact_sensitive_data(_object_text(obj))
+
+
+def _object_text(obj: Any) -> str:
+    """
+    The text of an object that is not a JSON primitive, as safely as possible.
+
+    A broken `__str__` must not turn redaction into a crash on the incident path,
+    and an object that cannot be rendered at all still must not be passed through
+    - so both cases degrade to a marker rather than to the original value.
+    """
+    for renderer in (str, repr):
+        try:
+            text = renderer(obj)
+        except Exception:  # noqa: BLE001 - a hostile __str__ must not break redaction
+            continue
+        if isinstance(text, str):
+            return text
+    return "[REDACTED_UNRENDERABLE_OBJECT]"
