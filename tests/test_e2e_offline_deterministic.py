@@ -38,7 +38,8 @@ from typing import Any, Dict
 
 import pytest
 
-from runner.doctor_runner import (
+from runner.doctor_runner import DoctorRunner
+from runner.timeline import (
     STAGE_AI_DIAGNOSIS,
     STAGE_CODES,
     STAGE_DETECTED,
@@ -50,7 +51,6 @@ from runner.doctor_runner import (
     STAGE_RETRY,
     STAGE_VERIFICATION,
     TIMELINE_STAGE_CODES,
-    DoctorRunner,
 )
 from runner.ollama_runtime import OLLAMA_NOT_INSTALLED, OLLAMA_RUNNING, OLLAMA_STOPPED
 from runner.redaction import sanitize_deep

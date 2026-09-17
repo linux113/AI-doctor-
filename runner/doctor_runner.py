@@ -8,52 +8,13 @@ import time
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 from .timeutil import now_iso
+from .timeline import STAGE_CODES
 
 from .tool_registry import diagnostic_registry
 from .remediation_registry import remediation_registry
 from .diagnostics import record_log
 from .diagnosis import diagnose
 from .ollama_runtime import OLLAMA_NOT_INSTALLED, OLLAMA_RUNNING, OLLAMA_UNHEALTHY
-
-
-# The pipeline stage vocabulary. `heal_incident` emits a human-readable `stage`
-# for display and one of these codes as `stage_code`, so a consumer can branch on
-# a stable identifier instead of parsing prose.
-STAGE_DETECTED = "DETECTED"
-STAGE_EVIDENCE_COLLECTED = "EVIDENCE_COLLECTED"
-STAGE_AI_DIAGNOSIS = "AI_DIAGNOSIS"
-STAGE_POLICY_CHECK = "POLICY_CHECK"
-STAGE_REMEDIATION_STARTED = "REMEDIATION_STARTED"
-STAGE_VERIFICATION = "VERIFICATION"
-STAGE_RETRY = "RETRY"
-STAGE_RECOVERED = "RECOVERED"
-STAGE_FAILED = "FAILED"
-
-TIMELINE_STAGE_CODES = (
-    STAGE_DETECTED,
-    STAGE_EVIDENCE_COLLECTED,
-    STAGE_AI_DIAGNOSIS,
-    STAGE_POLICY_CHECK,
-    STAGE_REMEDIATION_STARTED,
-    STAGE_VERIFICATION,
-    STAGE_RETRY,
-    STAGE_RECOVERED,
-    STAGE_FAILED,
-)
-
-# Display string -> code. Kept as a table so the two can never drift, and so a
-# missing mapping is a loud KeyError rather than a silently uncoded entry.
-STAGE_CODES = {
-    "DETECTED": STAGE_DETECTED,
-    "INVESTIGATING": STAGE_EVIDENCE_COLLECTED,
-    "ROOT CAUSE FOUND": STAGE_AI_DIAGNOSIS,
-    "POLICY CHECK": STAGE_POLICY_CHECK,
-    "REMEDIATION": STAGE_REMEDIATION_STARTED,
-    "VERIFYING": STAGE_VERIFICATION,
-    "RETRY": STAGE_RETRY,
-    "RESOLVED": STAGE_RECOVERED,
-    "FAILED": STAGE_FAILED,
-}
 
 
 class DoctorRunner:
@@ -335,17 +296,20 @@ class DoctorRunner:
             or "Unknown error"
         )
 
-        def add_stage(stage: str, description: str, **extra: Any) -> None:
+        def add_stage(stage: str, description: str, timestamp: Optional[str] = None,
+                      **extra: Any) -> None:
             """
             Appends one timeline entry with its machine-readable code.
 
             Every entry goes through here, so an entry without a `stage_code`
             cannot be produced and the display string and the code cannot drift.
+            `timestamp` defaults to now; the remediation entry passes the moment
+            the action actually started, which is before verification ran.
             """
             entry = {
                 "stage": stage,
                 "stage_code": STAGE_CODES[stage],
-                "timestamp": now(),
+                "timestamp": timestamp or now(),
                 "description": description,
             }
             entry.update(extra)
@@ -487,16 +451,15 @@ class DoctorRunner:
         failed_stage = recovery_outcome.get("stage")
         fix_succeeded = failed_stage != "FIX"
 
-        remediation_entry = {
-            "stage": "REMEDIATION",
-            "stage_code": STAGE_CODES["REMEDIATION"],
-            "timestamp": remediation_started_at,
-            "description": (
+        add_stage(
+            "REMEDIATION",
+            (
                 f"Executing allowlisted action: {remediation_action}"
                 if fix_succeeded
                 else f"Allowlisted action '{remediation_action}' failed: {recovery_outcome.get('error')}"
             ),
-            "details": {
+            timestamp=remediation_started_at,
+            details={
                 "action": remediation_action,
                 "allowlisted": self.remediation_registry.is_allowed(remediation_action),
                 "fix_succeeded": fix_succeeded,
@@ -504,22 +467,18 @@ class DoctorRunner:
                 "audit_entries": len(audit_log),
                 "error": None if fix_succeeded else recovery_outcome.get("error"),
             },
-        }
-        timeline.append(remediation_entry)
+        )
 
-        verification_entry = {
-            "stage": "VERIFYING",
-            "stage_code": STAGE_CODES["VERIFYING"],
-            "timestamp": now(),
-            "description": (
+        add_stage(
+            "VERIFYING",
+            (
                 "Verifying port 11434 and Ollama HTTP endpoint availability"
                 if fix_succeeded
                 else "Skipped: the remediation action itself failed, so there was no restored service to verify."
             ),
-            "verified": recovery_outcome["success"],
-            "details": recovery_outcome.get("verification") if fix_succeeded else None,
-        }
-        timeline.append(verification_entry)
+            verified=recovery_outcome["success"],
+            details=recovery_outcome.get("verification") if fix_succeeded else None,
+        )
 
         # RETRY: emitted only when a captured request was actually replayed. A
         # stage that did not happen must not appear in the timeline - the absence

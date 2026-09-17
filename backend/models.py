@@ -8,6 +8,7 @@ from typing import Optional, List, Dict, Any
 from datetime import datetime
 from runner.timeutil import now_iso
 from runner.redaction import sanitize_deep
+from runner.timeline import stage_code_for
 import uuid
 
 
@@ -51,6 +52,20 @@ class TimelineEvent(BaseModel):
     description: str
     details: Optional[Dict[str, Any]] = None
     verified: Optional[bool] = None
+
+    @model_validator(mode="after")
+    def _ensure_stage_code(self) -> "TimelineEvent":
+        """
+        Fills `stage_code` from the shared vocabulary.
+
+        Enforced here rather than at each construction site, because there are
+        several - the healing loop, the diagnose endpoint, the demo endpoints - and
+        an entry without a code is one a consumer cannot classify. Filling it in
+        one place means no path can forget.
+        """
+        if not self.stage_code:
+            self.stage_code = stage_code_for(self.stage)
+        return self
 
     @model_validator(mode="after")
     def _redact_secrets(self) -> "TimelineEvent":
