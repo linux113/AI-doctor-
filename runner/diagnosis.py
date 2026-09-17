@@ -5,10 +5,14 @@ Single source of truth
 ----------------------
 The root-cause decision table used to be implemented twice: once in
 `runner/doctor_runner.py` (the live path, called by `backend/main.py`) and
-once in `agent/strands_agent.py` (`StrandsAgentPlaceholder`, which nothing
-imported). The two had already drifted - different branch ordering, different
-wording, and different confidence values. Both now delegate here, so the
-Phase 2 Strands/Bedrock swap has exactly one seam to replace.
+once in a since-deleted agent-layer placeholder. The two had already drifted -
+different branch ordering, different wording, and different confidence values.
+Everything now delegates here.
+
+That consolidation is what made the Bedrock agent possible without a second
+copy: `agent/diagnosis_agent.py` calls this engine for the deterministic mode
+and hands its output to the model as a labelled *prior* in bedrock mode. There
+is still exactly one decision table, and it is this one.
 
 Evidence-derived confidence
 ---------------------------

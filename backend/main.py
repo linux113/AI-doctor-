@@ -40,6 +40,10 @@ from runner.redaction import sanitize_deep
 from runner.doctor_runner import doctor_runner
 from runner.remediation import start_ollama, stop_ollama
 from runner.remediation_registry import REMEDIATION_ALLOWLIST
+# Reports which diagnosis engine is configured. Imported at module scope because
+# /api/system-status is polled; the module itself defers every AWS import, so
+# loading it costs nothing when the SDK is absent.
+from agent.diagnosis_agent import describe_agent
 
 app = FastAPI(
     title="AI Doctor — Autonomous Troubleshooting & Recovery Agent",
@@ -179,6 +183,11 @@ def get_system_status():
             "cors_allow_credentials": CORS_ALLOW_CREDENTIALS,
             "remediation_allowlist": sorted(REMEDIATION_ALLOWLIST),
         },
+        # Which diagnosis engine is actually running. `llm_operational` is false
+        # unless bedrock mode is configured, the SDK is installed and a
+        # credential source exists, so the dashboard cannot claim an AI
+        # diagnosis the backend is not able to perform.
+        agent=describe_agent(),
     )
 
 
@@ -217,7 +226,14 @@ def run_diagnosis(payload: DiagnoseRequest):
     record_log("INFO", f"AI Doctor starting diagnostic investigation: {initial_error}", service="backend")
 
     evidence = doctor_runner.collect_evidence()
-    diagnosis = doctor_runner.diagnose_root_cause(evidence, initial_error)
+    # Same engine-selection seam as the heal loop, so the two endpoints can
+    # never disagree about who diagnosed the incident.
+    diagnosis = doctor_runner.diagnose_incident(
+        (incident.model_dump() if incident else {"detected_error": initial_error}),
+        evidence,
+        initial_error,
+        incident_id=incident.incident_id if incident else None,
+    )
 
     if incident:
         # Update incident timeline with diagnosis
@@ -239,6 +255,7 @@ def run_diagnosis(payload: DiagnoseRequest):
         incident.requires_human = bool(diagnosis.get("requires_human"))
         incident.root_cause = diagnosis["root_cause"]
         incident.confidence = diagnosis.get("confidence")
+        _apply_agent_record(incident, diagnosis)
         incident_repo.save(incident)
 
     return {
@@ -247,6 +264,26 @@ def run_diagnosis(payload: DiagnoseRequest):
         "diagnosis": diagnosis,
         "incident_id": incident.incident_id if incident else None,
     }
+
+
+def _apply_agent_record(incident: Incident, source: Dict[str, Any]) -> None:
+    """
+    Copies the agent-layer record onto an Incident.
+
+    Single place that knows the field names, so the diagnose and heal paths
+    cannot persist different subsets of it.
+    """
+    telemetry = source.get("agent_telemetry") or {}
+    incident.agent_mode = source.get("agent_mode") or telemetry.get("agent_mode")
+    incident.agent_status = source.get("agent_status")
+    incident.agent_note = source.get("agent_note")
+    incident.model_id = telemetry.get("model_id")
+    incident.aws_region = telemetry.get("aws_region")
+    incident.agent_latency_ms = telemetry.get("agent_latency_ms")
+    incident.diagnosis_confidence = telemetry.get("diagnosis_confidence")
+    incident.agent_telemetry = telemetry or None
+    incident.policy_decision = source.get("policy_decision")
+    incident.bedrock_failure = source.get("bedrock_failure")
 
 
 @app.post("/api/heal", dependencies=SENSITIVE_ROUTE_GUARD)
@@ -278,6 +315,10 @@ def run_heal(payload: HealRequest):
     incident.audit_log = outcome.get("audit_log") or []
     incident.runtime_state = outcome.get("runtime_state")
     incident.requires_human = outcome.get("requires_human")
+    # Which engine diagnosed this incident, how long it took, what it cost, and
+    # - if Bedrock was requested but unavailable - the real reason. Persisted
+    # rather than only returned, so the record survives the request.
+    _apply_agent_record(incident, outcome)
     incident.verification = outcome.get("verification")
     incident.retry_result = outcome.get("retry_result")
     # Which stage broke, so a failed FIX is not misreported as a failed VERIFY.

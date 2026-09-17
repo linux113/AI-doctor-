@@ -113,13 +113,40 @@ CREDENTIAL_PATTERNS = [
     (re.compile(r"(sk-[a-zA-Z0-9]{20,})", re.IGNORECASE), "[REDACTED_API_KEY]"),
 
     # --- Header and key/value forms --------------------------------------
+    # Short bearer credentials. The long-form rule below only fires at 20+
+    # characters, which left an 18-character token such as
+    # "Bearer SECRET-TOKEN-VALUE" exposed. Short tokens are redacted only when
+    # they look like a credential - containing a digit or a separator - so prose
+    # such as "Bearer authentication failed" keeps its meaning.
+    (
+        re.compile(
+            r"(Bearer\s+)(?=[A-Za-z0-9_.\-]{6,})(?=\S*(?:\d|[-_.]))[A-Za-z0-9_.\-]{6,}",
+            re.IGNORECASE,
+        ),
+        r"\1[REDACTED_TOKEN]",
+    ),
     (re.compile(r"(Bearer\s+)[a-zA-Z0-9_\.\-]{20,}", re.IGNORECASE), r"\1[REDACTED_TOKEN]"),
     (re.compile(r"(Basic\s+)[A-Za-z0-9+/=_\-]{16,}"), r"\1[REDACTED_TOKEN]"),
     # Connection-string credentials, e.g. postgres://user:hunter2@host
     (re.compile(r"(://[^/\s:@]+:)[^@\s/]+(@)"), r"\1[REDACTED_PASSWORD]\2"),
     (re.compile(r"(x-api-key\s*[:=]\s*['\"]?)[^\s'\",}]+(['\"]?)", re.IGNORECASE), r"\1[REDACTED_KEY]\2"),
-    (re.compile(r"(authorization\s*[:=]\s*['\"]?)[^\s'\",}]+(['\"]?)", re.IGNORECASE), r"\1[REDACTED_HEADER]\2"),
-    (re.compile(r"(api[_-]?key\s*[:=]\s*['\"]?)[a-zA-Z0-9_\-]{8,}(['\"]?)", re.IGNORECASE), r"\1[REDACTED_KEY]\2"),
+    # An Authorization value may carry an authentication scheme, i.e.
+    # "Authorization: Bearer <credential>". The scheme word and the credential
+    # are consumed together: matching only up to the first space redacted the
+    # word "Bearer" and left the secret itself in the string.
+    (
+        re.compile(
+            r"(authorization\s*[:=]\s*['\"]?)(?:(?:bearer|basic|token|digest)\s+)?[^\s'\",}]*(['\"]?)",
+            re.IGNORECASE,
+        ),
+        r"\1[REDACTED_HEADER]\2",
+    ),
+    # 4 characters, not 8: "api_key=SECRET" (the shape named in the redaction
+    # requirement) survived an 8-character minimum. Losing a placeholder such as
+    # "api_key=None" costs an operator almost nothing; leaking a short key costs
+    # everything, so the threshold errs towards redaction. The value class cannot
+    # match "[", which keeps repeated sanitisation idempotent.
+    (re.compile(r"(api[_-]?key\s*[:=]\s*['\"]?)[a-zA-Z0-9_\-]{4,}(['\"]?)", re.IGNORECASE), r"\1[REDACTED_KEY]\2"),
     # AWS_ACCESS_KEY_ID=... / aws_secret_access_key=... / access_key_id: ...
     (
         re.compile(

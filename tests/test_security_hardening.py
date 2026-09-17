@@ -420,28 +420,71 @@ def test_healthy_api_with_blind_process_probe_is_flagged():
     assert d.confidence <= 0.40
 
 
-def test_runner_and_agent_root_cause_logic_no_longer_drift():
+def test_root_cause_decision_table_has_exactly_one_implementation():
     """
-    runner/doctor_runner.py and agent/strands_agent.py each carried a private
-    copy of the decision table. They must now agree exactly.
+    The decision table used to exist twice - once in runner/doctor_runner.py and
+    once in agent/strands_agent.py - and the copies had drifted. The agent-layer
+    placeholder that held the second copy is gone: agent/ now contains a real
+    Bedrock agent and no rule engine of its own.
+
+    These assertions pin that. If a private duplicate ever reappears, or if the
+    runner stops delegating to runner.diagnosis, this fails.
     """
-    from agent.interfaces import IncidentContext
-    from agent.strands_agent import StrandsAgentPlaceholder
+    from pathlib import Path
 
-    agent = StrandsAgentPlaceholder()
-    ctx = IncidentContext(
-        incident_id="inc-drift",
-        error_message="boom",
-        http_status=500,
-        service="demo-inference-service",
-    )
+    import runner.diagnosis as diagnosis_module
 
+    # 1. The runner delegates to the shared engine instead of carrying a copy.
     for ev in (DOWN, HEALTHY, PROC_UP_PORT_DOWN, PORT_OPEN_API_DOWN, INCONSISTENT):
         runner_result = doctor_runner.diagnose_root_cause(ev, "boom")
-        agent_result = agent.evaluate_root_cause(ctx, ev)
-        assert runner_result["recommended_remediation"] == agent_result.recommended_action
-        assert runner_result["root_cause"] == agent_result.detected_root_cause
-        assert runner_result["confidence"] == pytest.approx(agent_result.confidence_score)
+        assert runner_result == diagnose(ev, "boom").as_dict()
+
+    # 2. No agent module re-implements the table or fakes an AWS client.
+    agent_dir = Path(diagnosis_module.__file__).resolve().parent.parent / "agent"
+    forbidden_definitions = (
+        "def evaluate_root_cause",
+        "def diagnose_root_cause",
+        "class StrandsAgentPlaceholder",
+        "class BedrockClientPlaceholder",
+        "class BedrockClientInterface",
+        "class StrandsAgentInterface",
+    )
+    for path in sorted(agent_dir.glob("*.py")):
+        source = path.read_text(encoding="utf-8")
+        for marker in forbidden_definitions:
+            assert marker not in source, f"{path.name} re-implements the agent seam: {marker}"
+
+    # 3. The fake AWS client module no longer exists at all.
+    assert not (agent_dir / "bedrock_client.py").exists(), (
+        "agent/bedrock_client.py was a placeholder that stood in for Amazon "
+        "Bedrock; the real integration lives in agent/strands_agent.py"
+    )
+
+
+def test_both_diagnosis_producers_return_the_same_report_contract():
+    """
+    The deterministic engine and the Bedrock agent are two producers of one
+    report shape. If they disagree, the runner, the API and the dashboard would
+    each need a branch - which is exactly how the original drift happened.
+    """
+    from agent.diagnosis_agent import REPORT_CONTRACT_KEYS
+
+    engine_keys = set(diagnose(DOWN, "boom").as_dict())
+    assert set(REPORT_CONTRACT_KEYS) == engine_keys
+
+    outcome = doctor_runner.diagnose_incident(
+        {"incident_id": "inc-contract", "detected_error": "boom"}, DOWN, "boom"
+    )
+    # Every contract key is present, whichever engine answered.
+    assert engine_keys <= set(outcome)
+    # And the mode is always stated explicitly.
+    assert outcome["agent_mode"] in ("bedrock", "deterministic")
+    assert outcome["agent_status"]
+    assert outcome["agent_note"]
+    assert outcome["agent_telemetry"]["agent_mode"] == outcome["agent_mode"]
+    # In this environment no model can run, so nothing may claim it did.
+    assert outcome["used_llm"] is False
+    assert outcome["agent_telemetry"]["model_id"] is None
 
 
 def test_diagnosis_serialisation_keeps_the_legacy_contract():

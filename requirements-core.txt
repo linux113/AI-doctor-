@@ -17,7 +17,9 @@ psutil>=5.9.0
 pytest>=7.4.0
 httpx>=0.26.0
 
-# AWS Phase 2 (goal: Bedrock + DynamoDB + Strands wiring).
-# Pinned as extras so the local MVP does not require AWS credentials.
-# boto3>=1.34.0
-# strands-agents>=0.1.0
+# Amazon Bedrock / AWS Strands Agents is deliberately NOT listed here.
+# Deterministic offline mode - the default, and what the test suite runs on -
+# needs no AWS SDK and no credentials. For AI_DOCTOR_AGENT_MODE=bedrock install
+# the real SDK separately:
+#
+#   pip install -r requirements-aws.txt

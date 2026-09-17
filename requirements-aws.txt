@@ -1,0 +1,25 @@
+# AWS Strands Agents + Amazon Bedrock provider for AI_DOCTOR_AGENT_MODE=bedrock.
+#
+#   pip install -r requirements-aws.txt
+#
+# These are the REAL packages the agent layer imports - `strands.models.BedrockModel`,
+# `strands.Agent` and the boto3/botocore clients underneath them. Nothing in this
+# file is a stand-in, and nothing here is required by deterministic offline mode:
+# requirements-core.txt stays lean and the whole suite runs without it.
+#
+# Versions verified against the installed environment (see
+# tests/test_bedrock_contract.py, which asserts the SDK is importable and reports
+# the exact version rather than trusting this comment):
+#
+#   strands-agents  1.56.0
+#   boto3           1.43.96
+#   botocore        1.43.96
+#
+# Python: strands-agents and boto3 both require >=3.10, so bedrock mode needs a
+# 3.10+ interpreter. Deterministic mode still runs on 3.9.
+#
+# NOTE: there is no `strands-agents[bedrock]` extra. boto3 and botocore are core
+# dependencies of the SDK, so the Bedrock provider needs no additional package.
+
+strands-agents>=1.56,<2
+boto3>=1.43,<2

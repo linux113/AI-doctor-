@@ -25,6 +25,12 @@ _SENSITIVE_INCIDENT_FIELDS = (
     "request_context",
     "action_result",
     "audit_log",
+    # Agent-layer fields can carry model-generated prose and AWS error text, so
+    # they pass through the same boundary as everything else.
+    "agent_note",
+    "agent_telemetry",
+    "policy_decision",
+    "bedrock_failure",
 )
 
 _SENSITIVE_TIMELINE_FIELDS = ("description", "details")
@@ -74,6 +80,28 @@ class Incident(BaseModel):
     runtime_state: Optional[str] = None
     # True when no allowlisted remediation can fix the root cause.
     requires_human: Optional[bool] = None
+
+    # --- Which engine produced the diagnosis --------------------------------
+    # Recorded on every incident so a rule-engine conclusion can never be read
+    # as a model conclusion. `agent_mode` is the answer to "who diagnosed this":
+    #   bedrock        a real Amazon Bedrock call returned this diagnosis
+    #   deterministic  the offline rule engine returned it
+    # `agent_status` adds how it ended: DIAGNOSED, REQUIRES_HUMAN,
+    # DETERMINISTIC, FALLBACK_DETERMINISTIC (bedrock was requested but
+    # unavailable) or FAILED. No credential material is stored here - only
+    # identifiers, counters and the class/detail of a failure.
+    agent_mode: Optional[str] = None
+    agent_status: Optional[str] = None
+    agent_note: Optional[str] = None
+    model_id: Optional[str] = None
+    aws_region: Optional[str] = None
+    agent_latency_ms: Optional[int] = None
+    diagnosis_confidence: Optional[float] = None
+    agent_telemetry: Optional[Dict[str, Any]] = None
+    # The allowlist gate's verdict on whatever the model recommended.
+    policy_decision: Optional[Dict[str, Any]] = None
+    # Present only when bedrock mode was requested and could not be used.
+    bedrock_failure: Optional[Dict[str, Any]] = None
     evidence: Optional[Dict[str, Any]] = None
     action_taken: Optional[str] = None
     # What the allowlisted action itself reported, kept separate from the
@@ -155,3 +183,7 @@ class SystemStatus(BaseModel):
     # CORS origins, and the remediation allowlist. Reports configuration state
     # only - never a secret value.
     security: Optional[Dict[str, Any]] = None
+    # Which diagnosis engine is configured, whether a model call could actually
+    # succeed, and any warning that explains a mismatch between the two. Reports
+    # configuration state only - never a credential or its contents.
+    agent: Optional[Dict[str, Any]] = None

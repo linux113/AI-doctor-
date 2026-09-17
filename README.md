@@ -77,25 +77,73 @@ Audited and hardened — see **[SECURITY.md](SECURITY.md)** for the full finding
   - *Heal Incident*: Executes autonomous recovery loop.
 - **Evidence Inspector**: Shows raw port status, process IDs, API reachability, and redacted audit logs.
 
-### 5. AWS Phase 2 Integration Architecture
-- `agent/interfaces.py`: Clean abstract interfaces for future **AWS Strands Agents** and **Amazon Bedrock (Claude 3.5 Sonnet)** without fake AWS mocks.
-- `infrastructure/dynamodb_schema.json`: Complete DynamoDB table schema with Partition Key (`incident_id`), Sort Key (`created_at`), and `StatusCreatedAtIndex` GSI.
-- `infrastructure/aws_architecture.md`: Full architectural specification for AWS cloud deployment (API Gateway, Lambda, Step Functions, Systems Manager, CloudWatch, S3, DynamoDB).
+### 5. Diagnosis Engines: AWS Strands + Amazon Bedrock, and the Offline Rule Engine
 
-**The Bedrock/Strands seam is now a single call site.** `runner/diagnosis.py`
-owns the deterministic decision table, and both `DoctorRunner` and
-`StrandsAgentPlaceholder` delegate to it. Swapping in a foundation model means
-replacing that one function with a Bedrock call that receives the same evidence
-bundle and returns the same `Diagnosis` shape — keeping the deterministic path as
-the fallback for when the model is unreachable or proposes an action outside
-`REMEDIATION_ALLOWLIST`. `select_remediation()` already enforces that allowlist
-independently of what the reasoning layer suggests.
+The system has **two** diagnosis engines and it always tells you which one ran.
 
-Two prerequisites for the DynamoDB swap are already in place: `created_at` is a
-fixed-width UTC string (`runner/timeutil.py`), so lexicographic sort order is
-stable for use as a RANGE key, and every diagnosis now carries
-`confidence`/`failed_stage` fields that persist through
-`Incident.to_dynamodb_item()`.
+| | `DETERMINISTIC OFFLINE MODE` | `BEDROCK AGENT MODE` |
+|---|---|---|
+| `AI_DOCTOR_AGENT_MODE` | `deterministic` *(default)* | `bedrock` |
+| Reasoning | Rule engine, `runner/diagnosis.py` | Amazon Bedrock foundation model via the **AWS Strands Agents SDK** |
+| AWS / network | none | real `bedrock-runtime` calls |
+| Credentials needed | no | yes (standard boto3 chain) |
+| Reproducible | yes, exactly | no — a model answer varies |
+| `Incident.agent_mode` | `deterministic` | `bedrock` |
+
+**Nothing is faked.** `agent/strands_agent.py` builds a real
+`strands.models.BedrockModel` and a real `strands.Agent`, and calls it with
+`structured_output_model=DiagnosisResult`. The earlier
+`StrandsAgentPlaceholder` and `BedrockClientPlaceholder` — a rule engine and a
+stub client wearing agent-shaped coats — have been **deleted**, along with the
+`BedrockClientInterface` / `StrandsAgentInterface` abstractions whose only
+implementation was local.
+
+#### Agent execution flow
+
+```
+DETECT  ->  COLLECT EVIDENCE  ->  [redact + catalogue]  ->  STRANDS AGENT + BEDROCK
+        ->  structured DiagnosisResult  ->  SCHEMA VALIDATION  ->  POLICY VALIDATION
+        ->  existing REMEDIATION_ALLOWLIST  ->  EXECUTE  ->  VERIFY  ->  RETRY  ->  RESOLVED
+```
+
+The model **analyses and recommends**. It never executes. Its reply is a
+`DiagnosisResult`; the policy layer maps it onto a canonical action constant and
+the existing allowlisted registry performs it. Verification and retry remain the
+deterministic code they always were.
+
+#### Tools the model may call
+
+Exactly five, all read-only, all loopback-bound: `check_ollama`, `check_port`,
+`check_process`, `get_recent_logs`, `health_check`.
+
+There is **no** `run_command`, no shell, no `exec`/`eval`, no arbitrary
+filesystem access and no arbitrary HTTP tool — and no parameter on any of the
+five that would let the model supply a host, a path or a command. Tool calls are
+counted against a per-incident budget.
+
+#### Honest failure
+
+If Bedrock cannot be used — no credentials, unroutable endpoint, model not
+enabled, throttled past the bounded retry budget, SDK missing — the incident
+records the **real AWS error class and message**. With
+`AI_DOCTOR_AGENT_FALLBACK=deterministic` (default) the offline engine then runs
+and the incident is labelled `agent_mode=deterministic`,
+`agent_status=FALLBACK_DETERMINISTIC` with no `model_id`, because no model was
+invoked. With `AI_DOCTOR_AGENT_FALLBACK=fail` no substitution happens and no
+remediation is attempted.
+
+A rule-based conclusion is never reported as a Bedrock diagnosis, and a
+diagnosis is never labelled "AI" when a Python `if` statement produced it.
+
+#### Cloud deployment (next phase, not built here)
+
+The code is structured so a later phase can deploy
+Browser → API Gateway → Lambda → Strands → Bedrock → diagnostic/policy →
+local Doctor Runner. The agent layer has no server-side state, takes its
+configuration from the environment, and returns a plain report dict — so it can
+run inside a Lambda unchanged. `infrastructure/aws_architecture.md` and
+`infrastructure/dynamodb_schema.json` describe that target. **No cloud resource
+is deployed by this repository.**
 
 > **Note:** incident storage is still in-process, so run the backend with a
 > **single** uvicorn worker until the DynamoDB repository lands. With
@@ -109,12 +157,19 @@ stable for use as a RANGE key, and every diagnosis now carries
 ```
 AI-doctor-/
 ├── SECURITY.md                     # Security model, audit findings & reproductions
-├── requirements-core.txt           # Minimal install: the recovery agent
+├── requirements-core.txt           # Minimal install: the recovery agent (no AWS)
+├── requirements-aws.txt            # Real AWS Strands Agents SDK + boto3, for bedrock mode
 ├── requirements.txt                # Full install: recovery agent + DeepTeam red teaming
 ├── agent/
-│   ├── interfaces.py               # Clean contracts for Strands & Bedrock
-│   ├── strands_agent.py            # Local agent reasoning (delegates to runner/diagnosis.py)
-│   └── bedrock_client.py           # Bedrock client placeholder interface
+│   ├── config.py                   # Env-driven config, validation, credential-source hint
+│   ├── diagnosis_agent.py          # THE mode switch: bedrock | deterministic, honest fallback
+│   ├── strands_agent.py            # Real Strands Agent + real BedrockModel (no placeholder)
+│   ├── schemas.py                  # DiagnosisResult / AgentTelemetry / PolicyDecision
+│   ├── prompts.py                  # System prompt, evidence fence, prompt assembly
+│   ├── evidence.py                 # Redact-first evidence catalogue with IDs and caps
+│   ├── tools.py                    # The five read-only tools + per-incident call budget
+│   ├── policy.py                   # Allowlist gate between the model and the executor
+│   └── interfaces.py               # Plain data holders (the fake-AWS interfaces are gone)
 ├── backend/
 │   ├── main.py                     # FastAPI REST server, failure injection, auth gate
 │   ├── models.py                   # Pydantic schemas (DynamoDB-compatible)
@@ -143,17 +198,27 @@ AI-doctor-/
 │   └── tool_registry.py            # Diagnostic tool registry
 ├── ai_doctor/                      # QUARANTINED medical-triage prototype (see
 │   │                               # ai_doctor/QUARANTINE.md) - not imported by the product
-└── tests/                            # 173 collected: 160 pass, 13 skip without real Ollama
+└── tests/                            # 572 collected: 556 pass, 16 skip (13 Ollama, 3 live AWS)
     ├── conftest.py                   # Real-Ollama detection + explicit integration skips
-    ├── test_security_hardening.py    # 76: SSRF, PID trust, registry, confidence, CORS, auth, redaction
+    ├── _fake_bedrock.py              # Fakes ONLY the HTTP transport; the SDK stays real
+    ├── test_agent_tools.py           # 93: tool surface, no dangerous parameter, call budget
+    ├── test_security_hardening.py    # 77: SSRF, PID trust, registry, confidence, CORS, auth, redaction
+    ├── test_agent_schemas.py         # 58: DiagnosisResult strictness, telemetry field set
+    ├── test_agent_prompt_injection.py# 58: adversarial evidence, fence escape, persuaded model
+    ├── test_agent_policy.py          # 58: allowlist gate, forbidden vocabulary, hallucinations
+    ├── test_bedrock_contract.py      # 47: real SDK/boto3 construction, request payload, no creds
+    ├── test_agent_modes.py           # 43: mode labelling, honest AWS failure, no silent fallback
+    ├── test_agent_evidence.py        # 25: evidence caps, truncation disclosure
     ├── test_defect_regressions.py    # 24: D1 false-positive recovery, D2 secret leak, D3 error class
     ├── test_ollama_integration.py    # 17: runtime matrix A-F (installed/running/stopped/absent/failed)
     ├── test_process_identity.py      # 13: process matching incl. a live decoy shell
+    ├── test_agent_redaction.py       # 10: nothing secret reaches the Bedrock request
     ├── test_ai_doctor.py             #  7: QUARANTINED medical component - not product coverage
     ├── test_retry.py                 #  6: request replay unit tests
     ├── test_remediation_allowlist.py #  6: security boundary & block verification
     ├── test_ollama_recovery.py       #  6: daemon recovery lifecycle
     ├── test_ollama_detection.py      #  6: service probe unit tests
+    ├── test_bedrock_live.py          #  6: real Bedrock call (3 skip) + negative controls
     ├── test_verification.py          #  4: post-remediation health verification
     ├── test_port_detection.py        #  4: TCP port socket probe tests
     ├── test_api_endpoints.py         #  3: full recovery lifecycle integration tests
@@ -195,7 +260,16 @@ pip install -r requirements-core.txt
 
 # Or everything, including the optional DeepTeam red-teaming component
 pip install -r requirements.txt
+
+# Only for AI_DOCTOR_AGENT_MODE=bedrock: the real AWS Strands Agents SDK.
+# Requires Python >=3.10 and AWS credentials. Deterministic mode needs neither.
+pip install -r requirements-aws.txt
 ```
+
+Verified versions for `requirements-aws.txt`: **strands-agents 1.56.0**,
+**boto3 1.43.96** (botocore 1.43.96). `tests/test_bedrock_contract.py` asserts
+the installed SDK version rather than trusting this line. There is no
+`strands-agents[bedrock]` extra — boto3 is a core dependency of the SDK.
 
 Dashboard:
 
@@ -246,9 +320,34 @@ substitute server is started to make them pass.
 | `AIDOCTOR_BACKEND_ORIGIN` | `http://127.0.0.1:8000` | Backend targeted by the Next.js proxy. |
 | `AIDOCTOR_OLLAMA_PID_FILE` | `/tmp/ollama.pid` | PID file path. Point at a non-world-writable directory in production. |
 
+Diagnosis-engine configuration (all optional; `agent/config.py` validates them at
+startup and refuses an unrecognised value rather than guessing):
+
+| Variable | Default | Effect |
+|---|---|---|
+| `AI_DOCTOR_AGENT_MODE` | `deterministic` | `bedrock` for a real Amazon Bedrock agent, `deterministic` for the offline rule engine. |
+| `AI_DOCTOR_AWS_REGION` | `us-east-1` *(bedrock only)* | Bedrock region. |
+| `AI_DOCTOR_BEDROCK_MODEL_ID` | `anthropic.claude-3-5-haiku-20241022-v1:0` | Model to invoke. Must be enabled in that region for your account. |
+| `AI_DOCTOR_AGENT_FALLBACK` | `deterministic` | `fail` to refuse any substitution when Bedrock is unavailable. |
+| `AI_DOCTOR_AGENT_TEMPERATURE` | `0.0` | 0.0–1.0. Low by design: this is troubleshooting, not creative writing. |
+| `AI_DOCTOR_AGENT_MAX_OUTPUT_TOKENS` | `1024` | Per-response output cap. |
+| `AI_DOCTOR_AGENT_MAX_TURNS` | `6` | Agent iterations before escalation to a human. |
+| `AI_DOCTOR_AGENT_MAX_TOOL_CALLS` | `8` | Diagnostic tool calls per incident. |
+| `AI_DOCTOR_AGENT_MAX_TOTAL_TOKENS` | `12000` | Token ceiling per incident. |
+| `AI_DOCTOR_AGENT_MAX_MODEL_ATTEMPTS` | `2` | Bedrock attempts on throttling. The SDK default (6 attempts, 4s–240s backoff) would hold an incident for ~124s. |
+| `AI_DOCTOR_AGENT_TIMEOUT_SECONDS` | `60` | boto3 read timeout. |
+| `AI_DOCTOR_MAX_EVIDENCE_BYTES` | `16000` | Evidence bundle cap; logs are dropped first. |
+| `AI_DOCTOR_MAX_LOG_LINES` | `25` | Log lines catalogued for the model. |
+| `AI_DOCTOR_MAX_PROMPT_CHARS` | `24000` | Prompt cap. Truncation is disclosed inside the prompt. |
+
+Credentials are **never** set here. `bedrock` mode uses the standard boto3 chain
+(environment, shared config, IAM role, IMDS). No credential value appears in
+source, in `.env`, in telemetry or in logs — `GET /api/system-status` reports only
+the *names* of the credential sources it found.
+
 ## Running Verification & Tests
 
-Run the full automated test suite (**102 passed, 1 skipped**):
+Run the full automated test suite (**556 passed, 16 skipped**):
 
 ```bash
 pytest tests/ -v
@@ -260,8 +359,13 @@ Recovery-agent tests only, without the optional medical component:
 pytest tests/ -v --ignore=tests/test_ai_doctor.py
 ```
 
-84 of these tests were added by the technical audit and pin each fix in
+Most of these tests were added by the technical audit and pin each fix in
 [SECURITY.md](SECURITY.md); they fail if a guardrail is later relaxed.
+
+The 16 skips are explicit, never substituted: 13 need the real `ollama` binary
+and 3 make a real, billable Bedrock call and require
+`AI_DOCTOR_RUN_LIVE_BEDROCK=1` plus credentials. See
+`tests/test_bedrock_live.py` for the exact command.
 
 Execute a deterministic end-to-end recovery test via CLI:
 

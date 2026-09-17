@@ -61,6 +61,44 @@ class DoctorRunner:
         """
         return diagnose(evidence, initial_error).as_dict()
 
+    def diagnose_incident(
+        self,
+        incident_data: Dict[str, Any],
+        evidence: Dict[str, Any],
+        detected_error: str,
+        incident_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Chooses the diagnosis engine according to `AI_DOCTOR_AGENT_MODE`.
+
+        In deterministic mode this is `diagnose_root_cause` plus two labelling
+        fields, so the offline behaviour and every existing assertion are
+        unchanged. In bedrock mode it performs a real Amazon Bedrock invocation
+        through the AWS Strands Agents SDK and returns a schema-validated,
+        policy-gated report.
+
+        The returned dict always carries `agent_mode`, `agent_status`,
+        `agent_note` and `agent_telemetry`, so no consumer can mistake a rule
+        engine conclusion for a model conclusion.
+
+        The agent package is imported here rather than at module scope: it
+        depends on `runner.redaction`, `runner.tool_registry` and
+        `runner.remediation_registry`, and a deferred import keeps that
+        relationship one-directional.
+        """
+        from agent.diagnosis_agent import run_diagnosis as run_agent_diagnosis
+
+        payload = dict(incident_data or {})
+        payload.setdefault("detected_error", detected_error)
+        outcome = run_agent_diagnosis(payload, evidence, incident_id=incident_id)
+
+        report = dict(outcome.report)
+        report["agent_telemetry"] = outcome.telemetry.as_dict()
+        report["policy_decision"] = outcome.policy_event
+        report["bedrock_failure"] = outcome.bedrock_failure
+        report["used_llm"] = outcome.used_llm
+        return report
+
     def run_remediation_and_verify(
         self,
         remediation_action: str,
@@ -71,6 +109,32 @@ class DoctorRunner:
         Safely executes remediation from allowlist, verifies service health, and retries the original request.
         """
         record_log("INFO", f"Initiating remediation action: {remediation_action}", service="doctor_runner")
+
+        # "none" means the diagnosis layer approved no action at all - a
+        # requires_human escalation, a refused model recommendation, or an
+        # exhausted iteration budget. It is handled here rather than pushed
+        # through the registry: the allowlist would reject it and log
+        # "SECURITY ALERT: Remediation action 'none' was BLOCKED", which is a
+        # false alarm for a deliberate no-op and would send an on-call engineer
+        # looking for an attack that did not happen. The incident still ends
+        # unresolved, which is the point.
+        if remediation_action in (None, "", "none"):
+            record_log(
+                "INFO",
+                "No remediation attempted: the diagnosis approved no action "
+                "(requires_human or refused recommendation).",
+                service="doctor_runner",
+            )
+            return {
+                "success": False,
+                "stage": "FIX",
+                "action": "none",
+                "no_action_taken": True,
+                "error": (
+                    "No remediation was attempted: the diagnosis did not approve an "
+                    "allowlisted action for this incident."
+                ),
+            }
 
         ctx = failed_request_context or {}
         # When the diagnosis is retry_request, the remediation *is* the replay
@@ -239,11 +303,23 @@ class DoctorRunner:
         evidence = self.collect_evidence()
 
         # 3. ROOT CAUSE FOUND
-        diagnosis = self.diagnose_root_cause(evidence, detected_error)
+        # Which engine answered is decided by AI_DOCTOR_AGENT_MODE and recorded
+        # on the incident: a deterministic rule-engine conclusion is never
+        # presented as a Bedrock diagnosis, and vice versa.
+        diagnosis = self.diagnose_incident(
+            incident_data, evidence, detected_error, incident_id=incident_id
+        )
+        agent_mode = diagnosis.get("agent_mode") or "deterministic"
+        agent_status = diagnosis.get("agent_status")
+        engine_label = (
+            f"Amazon Bedrock model {diagnosis.get('agent_telemetry', {}).get('model_id')}"
+            if agent_mode == "bedrock"
+            else "deterministic offline rule engine"
+        )
         timeline.append({
             "stage": "ROOT CAUSE FOUND",
             "timestamp": now(),
-            "description": diagnosis["root_cause"],
+            "description": f"[{engine_label}] {diagnosis['root_cause']}",
             "details": diagnosis,
         })
 
@@ -342,6 +418,17 @@ class DoctorRunner:
             # Additive: the runtime state and whether a human must intervene.
             "runtime_state": diagnosis.get("runtime_state") or (evidence.get("runtime") or {}).get("state"),
             "requires_human": bool(diagnosis.get("requires_human")),
+            # Which engine produced this diagnosis, so a rule-based answer can
+            # never be read as a model answer.
+            "agent_mode": agent_mode,
+            "agent_status": agent_status,
+            "agent_note": diagnosis.get("agent_note"),
+            "agent_telemetry": diagnosis.get("agent_telemetry"),
+            "policy_decision": diagnosis.get("policy_decision"),
+            "bedrock_failure": diagnosis.get("bedrock_failure"),
+            "model_id": (diagnosis.get("agent_telemetry") or {}).get("model_id"),
+            "aws_region": (diagnosis.get("agent_telemetry") or {}).get("aws_region"),
+            "diagnosis_confidence": diagnosis.get("confidence"),
             "evidence": evidence,
             "action_taken": remediation_action,
             # First-class outcome of the allowlisted action, distinct from the

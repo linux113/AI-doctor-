@@ -33,9 +33,13 @@ redteam = [
     "sentry-sdk>=2.0.0",
     "opentelemetry-exporter-otlp-proto-grpc>=1.24.0",
 ]
-# AWS Phase 2: Bedrock (Claude 3.5 Sonnet), DynamoDB, Strands Agents.
+# AWS Strands Agents + Amazon Bedrock provider (AI_DOCTOR_AGENT_MODE=bedrock).
+# Mirrors requirements-aws.txt. Not needed for deterministic offline mode, and
+# not installed by `pip install -e .` so the core install stays lean.
+# Both packages require Python >=3.10; the core runtime still supports 3.9.
 aws = [
-    "boto3>=1.34.0",
+    "strands-agents>=1.56,<2",
+    "boto3>=1.43,<2",
 ]
 
 [tool.pytest.ini_options]
