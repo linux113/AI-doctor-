@@ -7,7 +7,7 @@ DO NOT fake AWS integration: clean dataclasses and interfaces ready for AWS Phas
 from abc import ABC, abstractmethod
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 @dataclass
@@ -16,7 +16,7 @@ class IncidentContext:
     error_message: str
     http_status: int
     service: str
-    timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
+    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z")
     request_url: Optional[str] = None
     request_payload: Optional[Dict[str, Any]] = None
 
@@ -28,7 +28,15 @@ class DiagnosticReport:
     detected_root_cause: str
     confidence_score: float
     recommended_action: str
-    created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z")
+    # Additive provenance: which read-only probes supported the conclusion and
+    # which argued against it. Lets a Bedrock-synthesised diagnosis be audited
+    # against the same evidence the deterministic engine used.
+    hypothesis: Optional[str] = None
+    corroborating_probes: List[str] = field(default_factory=list)
+    contradicting_probes: List[str] = field(default_factory=list)
+    evidence_consistent: bool = True
+    notes: Optional[str] = None
 
 
 class BedrockClientInterface(ABC):

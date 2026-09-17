@@ -6,6 +6,7 @@ Structured for 1:1 compatibility with Amazon DynamoDB document records.
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from datetime import datetime
+from runner.timeutil import now_iso
 import uuid
 
 
@@ -19,15 +20,22 @@ class TimelineEvent(BaseModel):
 
 class Incident(BaseModel):
     incident_id: str = Field(default_factory=lambda: f"inc-{uuid.uuid4().hex[:8]}")
-    created_at: str = Field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
+    created_at: str = Field(default_factory=lambda: now_iso())
     status: str = "DETECTED"  # DETECTED, INVESTIGATING, ROOT CAUSE FOUND, REMEDIATION, VERIFYING, RESOLVED, FAILED
     http_status: int = 500
     detected_error: str
     service: str = "ollama-inference-service"
     root_cause: Optional[str] = None
+    # Evidence-derived confidence in root_cause, 0..1. Deliberately low when
+    # the infrastructure probes are all healthy and the failure is therefore
+    # unexplained.
+    confidence: Optional[float] = None
     evidence: Optional[Dict[str, Any]] = None
     action_taken: Optional[str] = None
     verification: Optional[Dict[str, Any]] = None
+    retry_result: Optional[Dict[str, Any]] = None
+    # "FIX" or "VERIFY" - which stage broke. None unless status is FAILED.
+    failed_stage: Optional[str] = None
     final_result: Optional[str] = None
     timeline: List[TimelineEvent] = Field(default_factory=list)
     request_context: Optional[Dict[str, Any]] = None
@@ -60,3 +68,7 @@ class SystemStatus(BaseModel):
     port_11434_open: bool
     active_incidents_count: int
     timestamp: str
+    # Effective security posture: whether the token gate is on, the configured
+    # CORS origins, and the remediation allowlist. Reports configuration state
+    # only - never a secret value.
+    security: Optional[Dict[str, Any]] = None

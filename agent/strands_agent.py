@@ -27,35 +27,37 @@ class StrandsAgentPlaceholder(StrandsAgentInterface):
 
     def evaluate_root_cause(self, context: IncidentContext, evidence: Dict[str, Any]) -> DiagnosticReport:
         """
-        Deterministic evidence evaluation matching the local Ollama failure scenario.
-        Phase 2: Passes evidence to Amazon Bedrock for generative root cause synthesis.
+        Evaluates collected evidence against the incident symptoms.
+
+        Delegates to runner.diagnosis, the single source of truth for the
+        decision table. This class previously carried its own private copy of
+        that table; the two had already diverged (different branch order,
+        different wording, different confidence values), so a fix applied to
+        one silently did not apply to the other.
+
+        Phase 2: this is the seam to replace. Swap the deterministic engine for
+        an Amazon Bedrock call that receives the same evidence bundle and must
+        return the same DiagnosticReport shape - and keep the deterministic
+        path as the fallback for when the model is unreachable or returns an
+        action outside the allowlist.
         """
-        port_open = evidence.get("port_11434", {}).get("is_open", False)
-        proc_running = evidence.get("process_ollama", {}).get("is_running", False)
-        ollama_available = evidence.get("ollama_api", {}).get("is_available", False)
+        # Imported lazily so the agent package stays importable without the
+        # local runner's native dependencies (psutil). runner.diagnosis itself
+        # is dependency-free; it is runner/__init__ that pulls them in.
+        from runner.diagnosis import diagnose
 
-        if not proc_running and not port_open:
-            root_cause = (
-                "Ollama daemon process is terminated. Port 11434 is closed. "
-                "The application cannot reach the local AI runtime."
-            )
-            recommended_action = "start_ollama"
-            confidence = 0.99
-        elif not ollama_available:
-            root_cause = "Ollama API endpoint failed to respond to health probes on port 11434."
-            recommended_action = "start_ollama"
-            confidence = 0.95
-        else:
-            root_cause = f"Application error: {context.error_message}"
-            recommended_action = "retry_request"
-            confidence = 0.80
-
+        d = diagnose(evidence, context.error_message)
         return DiagnosticReport(
             incident_id=context.incident_id,
             evidence=evidence,
-            detected_root_cause=root_cause,
-            confidence_score=confidence,
-            recommended_action=recommended_action,
+            detected_root_cause=d.root_cause,
+            confidence_score=d.confidence,
+            recommended_action=d.recommended_remediation,
+            hypothesis=d.hypothesis,
+            corroborating_probes=d.corroborating_probes,
+            contradicting_probes=d.contradicting_probes,
+            evidence_consistent=d.evidence_consistent,
+            notes=d.notes,
         )
 
     def select_remediation(self, report: DiagnosticReport, allowlist: List[str]) -> str:

@@ -50,6 +50,20 @@ All diagnostics are strictly **read-only**:
   - `exec()` is strictly forbidden.
   - `os.system(user_input)` is strictly forbidden.
   - Arbitrary shell commands or LLM-generated code are rejected at the registry boundary and logged as security violations.
+  - The single `subprocess.Popen` in the codebase uses a fixed argv list built from `sys.executable` — there is no shell and no user-controlled string on any execution path.
+
+### 3a. Hardened Security Boundary
+Audited and hardened — see **[SECURITY.md](SECURITY.md)** for the full findings, reproductions and regression tests.
+
+- **SSRF-safe retries**: `retry_request` destinations are validated structurally (`runner/security.py`), not by string prefix. `http://127.0.0.1.evil.com` and `http://localhost@evil.com` are both refused; userinfo components are rejected outright.
+- **Process identity, not mention**: `check_process` and `stop_ollama` match on executable name or `-m` module position (`runner/procmatch.py`). A shell that merely *mentions* "ollama" is no longer counted as the daemon — nor killed by it.
+- **PID files are hints, never authority**: every PID is identity-verified before it is signalled, and the file is written `0600` (`runner/pidfile.py`). This closes a confused-deputy path through world-writable `/tmp`.
+- **Failures are attributed correctly**: the registry honours an action's own failure verdict, so a broken FIX is no longer misreported as a VERIFY timeout.
+- **Evidence-derived confidence**: root-cause confidence is computed from how many of the three independent probes corroborate the hypothesis. Contradictory evidence is detected and reported at low confidence instead of being absorbed by a high-confidence branch.
+- **One decision table**: `runner/diagnosis.py` is the single source of truth; `doctor_runner` and the Strands agent both delegate to it, so they cannot drift.
+- **Wider credential redaction**: 20 patterns covering AWS/Anthropic/OpenAI/GitHub/Slack/Google/Stripe keys, JWTs, PEM private-key blocks, connection strings and common auth headers — verified not to over-redact operational log lines.
+- **Correct CORS**: a wildcard origin is never combined with `allow_credentials`.
+- **Optional auth gate**: `AIDOCTOR_API_TOKEN` protects the four process-controlling routes (disabled by default so local development is unchanged). The dashboard injects it server-side, so the browser never holds it.
 
 ### 4. Developer Dashboard (Next.js + React + Tailwind + Framer Motion)
 - **Live System Health Cards**: Application, Ollama Runtime, TCP Port 11434, Backend API, Doctor Runner.
@@ -68,45 +82,92 @@ All diagnostics are strictly **read-only**:
 - `infrastructure/dynamodb_schema.json`: Complete DynamoDB table schema with Partition Key (`incident_id`), Sort Key (`created_at`), and `StatusCreatedAtIndex` GSI.
 - `infrastructure/aws_architecture.md`: Full architectural specification for AWS cloud deployment (API Gateway, Lambda, Step Functions, Systems Manager, CloudWatch, S3, DynamoDB).
 
+**The Bedrock/Strands seam is now a single call site.** `runner/diagnosis.py`
+owns the deterministic decision table, and both `DoctorRunner` and
+`StrandsAgentPlaceholder` delegate to it. Swapping in a foundation model means
+replacing that one function with a Bedrock call that receives the same evidence
+bundle and returns the same `Diagnosis` shape — keeping the deterministic path as
+the fallback for when the model is unreachable or proposes an action outside
+`REMEDIATION_ALLOWLIST`. `select_remediation()` already enforces that allowlist
+independently of what the reasoning layer suggests.
+
+Two prerequisites for the DynamoDB swap are already in place: `created_at` is a
+fixed-width UTC string (`runner/timeutil.py`), so lexicographic sort order is
+stable for use as a RANGE key, and every diagnosis now carries
+`confidence`/`failed_stage` fields that persist through
+`Incident.to_dynamodb_item()`.
+
+> **Note:** incident storage is still in-process, so run the backend with a
+> **single** uvicorn worker until the DynamoDB repository lands. With
+> `--workers >1` each worker holds its own incident store.
+
+
 ---
 
 ## Directory Structure
 
 ```
 AI-doctor-/
+├── SECURITY.md                     # Security model, audit findings & reproductions
+├── requirements-core.txt           # Minimal install: the recovery agent
+├── requirements.txt                # Full install: recovery agent + DeepTeam red teaming
 ├── agent/
 │   ├── interfaces.py               # Clean contracts for Strands & Bedrock
-│   ├── strands_agent.py            # Local agent reasoning implementation
+│   ├── strands_agent.py            # Local agent reasoning (delegates to runner/diagnosis.py)
 │   └── bedrock_client.py           # Bedrock client placeholder interface
 ├── backend/
-│   ├── main.py                     # FastAPI REST server & failure injection
+│   ├── main.py                     # FastAPI REST server, failure injection, auth gate
 │   ├── models.py                   # Pydantic schemas (DynamoDB-compatible)
 │   └── storage.py                  # Thread-safe incident document repository
 ├── frontend/
 │   ├── src/app/page.tsx            # Next.js + Framer Motion interactive dashboard
 │   ├── src/app/layout.tsx          # Dashboard layout & metadata
+│   ├── src/middleware.ts           # Server-side proxy; injects the API token
 │   ├── next.config.js              # Reverse proxy configuration
 │   └── package.json                # React 18, Next 14, Tailwind, Framer Motion
 ├── infrastructure/
-│   ├── aws_architecture.md        # AWS native service mapping & security specs
+│   ├── aws_architecture.md         # AWS native service mapping & security specs
 │   └── dynamodb_schema.json        # DynamoDB table and GSI definition
 ├── runner/
 │   ├── diagnostics.py              # Read-only tools & credential scrubber
+│   ├── diagnosis.py                # Deterministic root-cause engine (single source of truth)
 │   ├── doctor_runner.py            # Autonomous loop orchestrator
 │   ├── ollama_service.py           # Local Ollama HTTP daemon (:11434)
+│   ├── pidfile.py                  # Verified PID handling (no confused deputy)
+│   ├── procmatch.py                # Process identity matching (not substring mention)
 │   ├── remediation.py              # Allowlisted safe remediation functions
 │   ├── remediation_registry.py     # Strict security allowlist & audit log
+│   ├── security.py                 # SSRF guard for retry destinations
+│   ├── timeutil.py                 # Timezone-aware, fixed-width UTC timestamps
 │   └── tool_registry.py            # Diagnostic tool registry
-├── tests/
-│   ├── test_api_endpoints.py       # Full recovery lifecycle integration tests
-│   ├── test_failure_detection.py   # Intentional failure & incident generation
-│   ├── test_ollama_detection.py    # Service probe unit tests
-│   ├── test_ollama_recovery.py     # Daemon recovery lifecycle
-│   ├── test_port_detection.py      # TCP port socket probe tests
-│   ├── test_remediation_allowlist.py # Security boundary & block verification
-│   ├── test_retry.py               # Request replay unit tests
-│   └── test_verification.py        # Post-remediation health verification
+├── ai_doctor/                      # OPTIONAL, separate component: medical-triage
+│   │                               # assistant + DeepTeam red teaming (see below)
+└── tests/
+    ├── test_security_hardening.py    # 72 tests: SSRF, PID trust, registry, confidence, CORS, auth, redaction
+    ├── test_process_identity.py      # 12 tests: process matching incl. a live decoy shell
+    ├── test_api_endpoints.py         # Full recovery lifecycle integration tests
+    ├── test_failure_detection.py     # Intentional failure & incident generation
+    ├── test_ollama_detection.py      # Service probe unit tests
+    ├── test_ollama_recovery.py       # Daemon recovery lifecycle
+    ├── test_port_detection.py        # TCP port socket probe tests
+    ├── test_remediation_allowlist.py # Security boundary & block verification
+    ├── test_retry.py                 # Request replay unit tests
+    ├── test_verification.py          # Post-remediation health verification
+    └── test_ai_doctor.py             # 7 tests for the optional medical component (skips w/o deepeval)
 ```
+
+### Two components in this repository
+
+This repository contains two distinct pieces of work that share a name:
+
+1. **The autonomous recovery agent** — `runner/`, `backend/`, `frontend/`, `agent/`.
+   This is what the rest of this README describes. Install with
+   `requirements-core.txt`; no LLM or AWS credentials required.
+2. **An optional medical-triage assistant** — `ai_doctor/`, `deepteam_config.yaml`,
+   `example_redteam.py`. This is a DeepTeam red-teaming target and is entirely
+   separate from the recovery loop. Install with `requirements.txt` (or
+   `pip install -e ".[redteam]"`). Its tests **skip** cleanly when `deepeval` is
+   absent rather than aborting collection of the recovery agent's suite.
 
 ---
 
@@ -120,13 +181,58 @@ AI-doctor-/
 
 ---
 
+## Installation
+
+```bash
+# Recovery agent only (recommended; no LLM or AWS credentials needed)
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements-core.txt
+
+# Or everything, including the optional DeepTeam red-teaming component
+pip install -r requirements.txt
+```
+
+Dashboard:
+
+```bash
+cd frontend && npm install
+```
+
+## Running the Stack
+
+```bash
+python -m runner.ollama_service                                   # :11434
+uvicorn backend.main:app --host 0.0.0.0 --port 8000               # :8000
+cd frontend && npm run dev                                        # :3000
+```
+
+Or via the root `package.json` scripts: `npm run ollama`, `npm run backend`, `npm run dashboard`.
+
+## Configuration
+
+| Variable | Default | Effect |
+|---|---|---|
+| `AIDOCTOR_API_TOKEN` | *(unset)* | Bearer token required by `/api/heal` and the `/api/demo/*` process-controlling routes. Gate is off when unset. Set it on **both** backend and frontend — the frontend injects it server-side so the browser never sees it. |
+| `AIDOCTOR_CORS_ORIGINS` | `*` | Comma-separated allowed origins. Credentials are enabled only when this is not `*`. |
+| `AIDOCTOR_BACKEND_ORIGIN` | `http://127.0.0.1:8000` | Backend targeted by the Next.js proxy. |
+| `AIDOCTOR_OLLAMA_PID_FILE` | `/tmp/ollama.pid` | PID file path. Point at a non-world-writable directory in production. |
+
 ## Running Verification & Tests
 
-Run the full automated test suite (25/25 tests passing):
+Run the full automated test suite (**102 passed, 1 skipped**):
 
 ```bash
 pytest tests/ -v
 ```
+
+Recovery-agent tests only, without the optional medical component:
+
+```bash
+pytest tests/ -v --ignore=tests/test_ai_doctor.py
+```
+
+84 of these tests were added by the technical audit and pin each fix in
+[SECURITY.md](SECURITY.md); they fail if a guardrail is later relaxed.
 
 Execute a deterministic end-to-end recovery test via CLI:
 

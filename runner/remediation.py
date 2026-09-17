@@ -16,8 +16,19 @@ import psutil
 from typing import Dict, Any, Optional
 
 from .diagnostics import check_port, check_ollama, check_process, record_log
+from .pidfile import (
+    DEFAULT_PID_FILE,
+    is_trusted_ollama_pid,
+    pid_file_permissions_warning,
+    read_trusted_pid,
+    remove_pid_file,
+)
+from .procmatch import OLLAMA_IDENTITIES, matches_process
+from .security import validate_retry_url
 
-OLLAMA_PID_FILE = "/tmp/ollama.pid"
+# Retained as an alias for backwards compatibility. The authoritative default
+# now lives in runner.pidfile so the writer and the reader cannot diverge.
+OLLAMA_PID_FILE = DEFAULT_PID_FILE
 
 
 def start_ollama() -> Dict[str, Any]:
@@ -86,36 +97,68 @@ def stop_ollama() -> Dict[str, Any]:
     """
     Safely stops any running Ollama process.
     Used for intentional failure generation and clean recovery testing.
+
+    Every PID is identity-verified before it is signalled. See runner/pidfile.py
+    for why: the previous version trusted the contents of a world-writable
+    /tmp file, which let any local user direct this remediation at an
+    arbitrary process.
     """
     record_log("WARN", "Intentional failure trigger: stopping Ollama service...", service="remediation")
     killed_pids = []
+    refused = []
+    self_pid = os.getpid()
 
-    # Find matching processes
+    perms_warning = pid_file_permissions_warning(OLLAMA_PID_FILE)
+    if perms_warning:
+        record_log("SECURITY", perms_warning, service="remediation")
+
+    # Find matching processes in the process table.
     for proc in psutil.process_iter(["pid", "name", "cmdline"]):
         try:
+            pid = proc.info["pid"]
             name = proc.info["name"] or ""
-            cmdline = " ".join(proc.info["cmdline"] or [])
-            # Target our runner.ollama_service or ollama binary
-            if "runner.ollama_service" in cmdline or name == "ollama":
-                pid = proc.info["pid"]
-                os.kill(pid, signal.SIGTERM)
-                killed_pids.append(pid)
-        except Exception:
+            argv = proc.info["cmdline"] or []
+
+            if pid == self_pid:
+                # Never signal ourselves.
+                continue
+
+            # Identity, not mention. The previous substring test also matched
+            # wrapper shells, editors and `tail -f ollama.log`, so invoking
+            # this remediation could SIGTERM the very process that called it.
+            matched, _reason = matches_process(name, argv, OLLAMA_IDENTITIES, strict=True)
+            if not matched:
+                continue
+
+            # Re-verify through the shared identity check so the process table
+            # sweep and the PID file path enforce exactly the same policy.
+            trusted, reason = is_trusted_ollama_pid(pid)
+            if not trusted:
+                refused.append({"pid": pid, "reason": reason})
+                record_log("SECURITY", f"Refused to signal PID {pid}: {reason}", service="remediation")
+                continue
+
+            os.kill(pid, signal.SIGTERM)
+            killed_pids.append(pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+        except OSError:
             continue
 
-    if os.path.exists(OLLAMA_PID_FILE):
+    # The PID file is a hint, not authority: read_trusted_pid only returns a
+    # PID whose live process has already been confirmed to be our service.
+    pid_from_file, refusal_reason = read_trusted_pid(OLLAMA_PID_FILE)
+    if refusal_reason:
+        refused.append({"pid_file": OLLAMA_PID_FILE, "reason": refusal_reason})
+        record_log("SECURITY", f"Refusing PID file target: {refusal_reason}", service="remediation")
+    elif pid_from_file is not None and pid_from_file not in killed_pids:
         try:
-            with open(OLLAMA_PID_FILE, "r") as f:
-                pid = int(f.read().strip())
-            os.kill(pid, signal.SIGTERM)
-            if pid not in killed_pids:
-                killed_pids.append(pid)
-        except Exception:
+            os.kill(pid_from_file, signal.SIGTERM)
+            killed_pids.append(pid_from_file)
+        except OSError:
             pass
-        try:
-            os.remove(OLLAMA_PID_FILE)
-        except Exception:
-            pass
+
+    remove_pid_file(OLLAMA_PID_FILE)
 
     time.sleep(0.5)
     port_down = not check_port(11434)["is_open"]
@@ -124,6 +167,7 @@ def stop_ollama() -> Dict[str, Any]:
     return {
         "action": "stop_ollama",
         "terminated_pids": killed_pids,
+        "refused_pids": refused,
         "port_11434_closed": port_down,
     }
 
@@ -139,15 +183,21 @@ def retry_request(
     Safely retries the original failed application request.
     Validates URL scheme and host to prevent SSRF.
     """
-    record_log("INFO", f"Retrying failed request to {url} ({method})", service="remediation")
-
-    # Safety check: enforce HTTP/HTTPS and local/approved endpoints only
-    if not (url.startswith("http://127.0.0.1") or url.startswith("http://localhost") or url.startswith("http://0.0.0.0")):
+    # Safety check: structurally validate the destination before any egress.
+    # See runner/security.py - the previous string-prefix check was bypassable
+    # with hosts like "http://127.0.0.1.evil.com" and "http://localhost@evil.com".
+    allowed, reason = validate_retry_url(url)
+    if not allowed:
+        # Log the reason but not the raw URL: a hostile destination string is
+        # attacker-controlled content and should not be laundered into logs.
+        record_log("SECURITY", f"Blocked retry_request: {reason}", service="remediation")
         return {
             "action": "retry_request",
             "success": False,
-            "error": "Security validation failed: Request destination must be local service.",
+            "error": f"Security validation failed: {reason}",
         }
+
+    record_log("INFO", f"Retrying failed request to {url[:200]} ({method})", service="remediation")
 
     data_bytes = None
     if payload is not None and method in ("POST", "PUT", "PATCH"):

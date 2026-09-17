@@ -4,16 +4,38 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-doctor"
-version = "0.1.0"
-description = "AI Doctor triage assistant integrated with DeepTeam LLM red teaming and safety guardrails"
+version = "0.2.0"
+description = "AI Doctor - autonomous developer troubleshooting & recovery agent (DETECT -> DIAGNOSE -> FIX -> VERIFY -> RETRY) with read-only diagnostics and a strict remediation allowlist"
 readme = "README.md"
 requires-python = ">=3.9"
+
+# Core runtime dependencies for the recovery agent (runner/, backend/, agent/).
+# The previous list declared only the optional red-teaming packages and omitted
+# everything the primary project actually imports, so `pip install -e .`
+# produced an environment that could not run the agent at all.
 dependencies = [
+    "fastapi>=0.110.0",
+    "uvicorn>=0.28.0",
+    "psutil>=5.9.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "httpx>=0.26.0",   # required by fastapi.testclient
+]
+# Optional medical-triage assistant (ai_doctor/) and DeepTeam red teaming.
+# tests/test_ai_doctor.py skips cleanly when this extra is not installed.
+redteam = [
     "deepteam",
-    "deepeval",
+    "deepeval>=1.0.0",
+    "openai>=1.0.0",
     "sentry-sdk>=2.0.0",
     "opentelemetry-exporter-otlp-proto-grpc>=1.24.0",
-    "openai>=1.0.0",
+]
+# AWS Phase 2: Bedrock (Claude 3.5 Sonnet), DynamoDB, Strands Agents.
+aws = [
+    "boto3>=1.34.0",
 ]
 
 [tool.pytest.ini_options]

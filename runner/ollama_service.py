@@ -11,7 +11,32 @@ import signal
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import socket
 
-PID_FILE = "/tmp/ollama.pid"
+# Importing as a package module (`python -m runner.ollama_service`) so the PID
+# file path and permissions policy are shared with the remediation that reads
+# it. Written 0600: a world-writable PID file lets another local user redirect
+# stop_ollama at an arbitrary process.
+if __package__:
+    from .pidfile import DEFAULT_PID_FILE, write_pid_file, remove_pid_file
+else:  # pragma: no cover - direct-script fallback
+    DEFAULT_PID_FILE = os.environ.get("AIDOCTOR_OLLAMA_PID_FILE", "/tmp/ollama.pid")
+
+    def write_pid_file(pid, path=DEFAULT_PID_FILE):
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(str(pid))
+            return True
+        except OSError:
+            return False
+
+    def remove_pid_file(path=DEFAULT_PID_FILE):
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+PID_FILE = DEFAULT_PID_FILE
 DEFAULT_PORT = 11434
 DEFAULT_HOST = "0.0.0.0"
 
@@ -121,16 +146,11 @@ def run_server(host=DEFAULT_HOST, port=DEFAULT_PORT):
     HTTPServer.allow_reuse_address = True
     httpd = HTTPServer(server_address, OllamaHTTPHandler)
 
-    # Write PID file
-    with open(PID_FILE, "w") as f:
-        f.write(str(os.getpid()))
+    # Write PID file with 0600 permissions (see runner/pidfile.py).
+    write_pid_file(os.getpid(), PID_FILE)
 
     def shutdown_handler(signum, frame):
-        try:
-            if os.path.exists(PID_FILE):
-                os.remove(PID_FILE)
-        except Exception:
-            pass
+        remove_pid_file(PID_FILE)
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, shutdown_handler)
@@ -141,11 +161,7 @@ def run_server(host=DEFAULT_HOST, port=DEFAULT_PORT):
         httpd.serve_forever()
     finally:
         httpd.server_close()
-        if os.path.exists(PID_FILE):
-            try:
-                os.remove(PID_FILE)
-            except Exception:
-                pass
+        remove_pid_file(PID_FILE)
 
 
 if __name__ == "__main__":

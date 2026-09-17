@@ -13,3 +13,6 @@ frontend/.next/
 .next/
 *.pid
 
+
+# TypeScript incremental build info (tsc --noEmit artifact)
+*.tsbuildinfo

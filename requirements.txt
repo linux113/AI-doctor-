@@ -1,6 +1,21 @@
-# DeepTeam LLM Red Teaming Framework
+# Full install: autonomous recovery agent + optional DeepTeam red-teaming
+# component (ai_doctor/).
+#
+# If you only want the recovery agent and its 18 tests, use the much lighter
+# requirements-core.txt instead.
+#
+# Previously this file installed deepteam but not deepeval, while
+# ai_doctor/guardrails.py imports deepeval directly. That made
+# `pip install -r requirements.txt && pytest tests/` fail at collection with
+# ModuleNotFoundError. deepeval is now listed explicitly.
+# It also omitted psutil/pytest/httpx, which the core agent and tests need.
+
+-r requirements-core.txt
+
+# DeepTeam LLM Red Teaming Framework (and its deepeval dependency).
 git+https://github.com/confident-ai/deepteam.git
+deepeval>=1.0.0
+
+# Observability for red-team runs.
 sentry-sdk>=2.0.0
 opentelemetry-exporter-otlp-proto-grpc>=1.24.0
-fastapi>=0.110.0
-uvicorn>=0.28.0

@@ -6,12 +6,12 @@ Includes the demo application endpoint with intentional failure generation.
 
 import os
 import json
+import secrets
 import urllib.request
 import urllib.error
-from datetime import datetime
 from typing import Optional, List, Dict, Any
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, status
+from fastapi import FastAPI, HTTPException, Header, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -24,6 +24,7 @@ from .models import (
     SystemStatus,
 )
 from .storage import incident_repo
+from runner.timeutil import now_iso
 from runner.diagnostics import (
     check_ollama,
     check_port,
@@ -34,6 +35,7 @@ from runner.diagnostics import (
 )
 from runner.doctor_runner import doctor_runner
 from runner.remediation import start_ollama, stop_ollama
+from runner.remediation_registry import REMEDIATION_ALLOWLIST
 
 app = FastAPI(
     title="AI Doctor — Autonomous Troubleshooting & Recovery Agent",
@@ -41,14 +43,80 @@ app = FastAPI(
     description="Backend API for incident detection, evidence collection, and automated healing.",
 )
 
-# Enable CORS for Next.js frontend and web preview iframe
+# ---------------------------------------------------------------------------
+# CORS
+#
+# A wildcard origin combined with allow_credentials=True is not a valid CORS
+# configuration - browsers reject the response - and it is the wrong default
+# for an API that can spawn and signal OS processes. The dashboard reaches this
+# backend through Next.js rewrites (same-origin from the browser's point of
+# view), so it does not need permissive CORS at all.
+#
+# Credentials are therefore enabled only when the operator has named explicit
+# origins. Override with a comma-separated AIDOCTOR_CORS_ORIGINS.
+# ---------------------------------------------------------------------------
+CORS_ORIGINS = [
+    o.strip()
+    for o in os.environ.get("AIDOCTOR_CORS_ORIGINS", "*").split(",")
+    if o.strip()
+]
+CORS_ALLOW_CREDENTIALS = "*" not in CORS_ORIGINS
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=CORS_ALLOW_CREDENTIALS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---------------------------------------------------------------------------
+# Optional token gate for state-changing / process-controlling endpoints.
+#
+# /api/heal, /api/demo/stop-ollama, /api/demo/start-ollama and
+# /api/demo/simulate-incident all spawn or signal OS processes and were
+# previously wide open. The gate is DISABLED unless AIDOCTOR_API_TOKEN is set,
+# so local development and the test suite behave exactly as before, while any
+# real deployment can set the variable and get an enforced boundary.
+#
+# frontend/next.config.js injects the same token server-side into the proxy
+# rewrite, so the browser never holds it.
+# ---------------------------------------------------------------------------
+API_TOKEN = os.environ.get("AIDOCTOR_API_TOKEN", "").strip()
+TOKEN_GATE_ENABLED = bool(API_TOKEN)
+
+
+def require_api_token(authorization: Optional[str] = Header(default=None)) -> None:
+    """
+    FastAPI dependency enforcing a bearer token on sensitive endpoints.
+
+    No-op when AIDOCTOR_API_TOKEN is unset. Uses a constant-time comparison so
+    the token cannot be recovered one character at a time.
+    """
+    if not TOKEN_GATE_ENABLED:
+        return
+
+    if not authorization:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing Authorization header. This endpoint controls OS processes.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if not secrets.compare_digest(authorization.strip(), f"Bearer {API_TOKEN}"):
+        record_log(
+            "SECURITY",
+            "Rejected a sensitive endpoint call carrying an invalid bearer token.",
+            service="backend",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid bearer token.",
+        )
+
+
+# Applied via dependencies=[...] on each state-changing route.
+SENSITIVE_ROUTE_GUARD = [Depends(require_api_token)]
 
 
 @app.get("/health")
@@ -60,7 +128,7 @@ def health_endpoint():
         "service": "ai-doctor-backend",
         "doctor_runner": "active",
         "system": overall,
-        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "timestamp": now_iso(),
     }
 
 
@@ -91,7 +159,14 @@ def get_system_status():
         doctor_runner="active",
         port_11434_open=port_res["is_open"],
         active_incidents_count=len(active_incidents),
-        timestamp=datetime.utcnow().isoformat() + "Z",
+        timestamp=now_iso(),
+        security={
+            # Reported, never the value itself.
+            "token_gate_enabled": TOKEN_GATE_ENABLED,
+            "cors_origins": CORS_ORIGINS,
+            "cors_allow_credentials": CORS_ALLOW_CREDENTIALS,
+            "remediation_allowlist": sorted(REMEDIATION_ALLOWLIST),
+        },
     )
 
 
@@ -134,7 +209,7 @@ def run_diagnosis(payload: DiagnoseRequest):
 
     if incident:
         # Update incident timeline with diagnosis
-        now_ts = datetime.utcnow().isoformat() + "Z"
+        now_ts = now_iso()
         incident.timeline.append(TimelineEvent(
             stage="INVESTIGATING",
             timestamp=now_ts,
@@ -149,6 +224,7 @@ def run_diagnosis(payload: DiagnoseRequest):
         incident.status = "ROOT CAUSE FOUND"
         incident.evidence = evidence
         incident.root_cause = diagnosis["root_cause"]
+        incident.confidence = diagnosis.get("confidence")
         incident_repo.save(incident)
 
     return {
@@ -159,7 +235,7 @@ def run_diagnosis(payload: DiagnoseRequest):
     }
 
 
-@app.post("/api/heal")
+@app.post("/api/heal", dependencies=SENSITIVE_ROUTE_GUARD)
 def run_heal(payload: HealRequest):
     """
     Executes the full autonomous recovery loop:
@@ -178,9 +254,13 @@ def run_heal(payload: HealRequest):
     # Persist updated incident state and timeline
     incident.status = outcome["status"]
     incident.root_cause = outcome.get("root_cause")
+    incident.confidence = outcome.get("confidence")
     incident.evidence = outcome.get("evidence")
     incident.action_taken = outcome.get("action_taken")
     incident.verification = outcome.get("verification")
+    incident.retry_result = outcome.get("retry_result")
+    # Which stage broke, so a failed FIX is not misreported as a failed VERIFY.
+    incident.failed_stage = outcome.get("failed_stage")
     incident.final_result = "Recovery Succeeded" if outcome["status"] == "RESOLVED" else "Recovery Failed"
     incident.resolved_at = outcome.get("resolved_at")
 
@@ -241,7 +321,7 @@ def demo_query(payload: DemoQueryRequest):
         record_log("ERROR", f"CRITICAL APPLICATION FAILURE: {error_msg}", service="demo_app")
 
         # Automatically detect and register the incident!
-        now_ts = datetime.utcnow().isoformat() + "Z"
+        now_ts = now_iso()
         incident = Incident(
             status="DETECTED",
             http_status=500,
@@ -275,7 +355,7 @@ def demo_query(payload: DemoQueryRequest):
         )
 
 
-@app.post("/api/demo/stop-ollama")
+@app.post("/api/demo/stop-ollama", dependencies=SENSITIVE_ROUTE_GUARD)
 def trigger_intentional_failure():
     """
     Intentional failure trigger: stops the Ollama service to simulate an outage.
@@ -288,14 +368,14 @@ def trigger_intentional_failure():
     }
 
 
-@app.post("/api/demo/start-ollama")
+@app.post("/api/demo/start-ollama", dependencies=SENSITIVE_ROUTE_GUARD)
 def trigger_start_ollama():
     """Manually starts the Ollama service."""
     res = start_ollama()
     return {"status": "started", "details": res}
 
 
-@app.post("/api/demo/simulate-incident")
+@app.post("/api/demo/simulate-incident", dependencies=SENSITIVE_ROUTE_GUARD)
 def simulate_incident_workflow():
     """
     Convenience endpoint for live demo / testing:
