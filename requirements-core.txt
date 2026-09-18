@@ -1,0 +1,25 @@
+# Core runtime for the autonomous recovery agent (runner/ + backend/ + agent/).
+#
+# This is the minimal install. It runs the full DETECT -> DIAGNOSE -> FIX ->
+# VERIFY -> RETRY loop, the FastAPI backend and the 18 agent/backend tests.
+# It deliberately does NOT pull deepeval/deepteam, which belong to the optional
+# medical-triage component under ai_doctor/.
+#
+#   pip install -r requirements-core.txt
+#   pytest tests/
+
+fastapi>=0.110.0
+uvicorn>=0.28.0
+psutil>=5.9.0
+
+# Test-only, but the suite cannot collect without them:
+# fastapi.testclient requires httpx, and the suite runs under pytest.
+pytest>=7.4.0
+httpx>=0.26.0
+
+# Amazon Bedrock / AWS Strands Agents is deliberately NOT listed here.
+# Deterministic offline mode - the default, and what the test suite runs on -
+# needs no AWS SDK and no credentials. For AI_DOCTOR_AGENT_MODE=bedrock install
+# the real SDK separately:
+#
+#   pip install -r requirements-aws.txt

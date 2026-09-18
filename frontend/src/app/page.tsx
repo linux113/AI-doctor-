@@ -22,6 +22,45 @@ import {
   Zap,
 } from 'lucide-react';
 
+interface AgentInfo {
+  agent_mode: string | null;
+  mode_uses_llm: boolean;
+  llm_operational: boolean;
+  configured: boolean;
+  provider?: string;
+  model_id?: string | null;
+  aws_region?: string | null;
+  strands_sdk_version?: string | null;
+  boto3_version?: string | null;
+  sdk_available?: boolean;
+  credential_sources?: string[];
+  fallback_policy?: string;
+  warnings?: string[];
+}
+
+interface AgentTelemetry {
+  agent_mode?: string;
+  model_id?: string | null;
+  aws_region?: string | null;
+  agent_latency_ms?: number | null;
+  diagnosis_confidence?: number | null;
+  tool_calls?: Record<string, number>;
+  tool_call_count?: number;
+  turns?: number;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  total_tokens?: number | null;
+  bedrock_request_id?: string | null;
+  stop_reason?: string | null;
+  strands_sdk_version?: string | null;
+  error_class?: string | null;
+  error_detail?: string | null;
+  // Stable machine-readable failure classification, and the AWS service code
+  // behind it. Both null on a successful call.
+  failure_kind?: string | null;
+  aws_error_code?: string | null;
+}
+
 interface SystemStatus {
   application: string;
   ollama: string;
@@ -30,6 +69,7 @@ interface SystemStatus {
   port_11434_open: boolean;
   active_incidents_count: number;
   timestamp: string;
+  agent?: AgentInfo | null;
 }
 
 interface TimelineEvent {
@@ -48,13 +88,59 @@ interface Incident {
   detected_error: string;
   service: string;
   root_cause?: string;
+  confidence?: number | null;
+  requires_human?: boolean | null;
   evidence?: any;
   action_taken?: string;
+  action_result?: any;
+  audit_log?: any[];
   verification?: any;
+  retry_result?: any;
   final_result?: string;
   timeline: TimelineEvent[];
   resolved_at?: string;
+  // Which engine produced this diagnosis. Present on every incident so the UI
+  // can never imply a model answered when the offline rule engine did.
+  agent_mode?: string | null;
+  // agent_status is the ROUND TRIP (what Bedrock did); diagnosis_outcome is the
+  // DECISION (what the pipeline concluded). bedrock_invoked is true only when a
+  // real request reached Bedrock and answered; used_llm only when a model
+  // produced the validated diagnosis. The UI must not claim an AI diagnosis
+  // unless used_llm is true.
+  agent_status?: string | null;
+  diagnosis_outcome?: string | null;
+  bedrock_invoked?: boolean | null;
+  used_llm?: boolean | null;
+  agent_note?: string | null;
+  model_id?: string | null;
+  aws_region?: string | null;
+  agent_latency_ms?: number | null;
+  diagnosis_confidence?: number | null;
+  agent_telemetry?: AgentTelemetry | null;
+  policy_decision?: {
+    allowed?: boolean;
+    requested_action?: string;
+    approved_action?: string | null;
+    violation?: string | null;
+    reason?: string;
+    requires_human?: boolean;
+  } | null;
+  bedrock_failure?: {
+    failure_kind?: string;
+    error_class?: string;
+    aws_error_code?: string | null;
+    error_detail?: string;
+    attempted_model_id?: string | null;
+    attempted_region?: string | null;
+  } | null;
 }
+
+// Human-readable name for each diagnosis mode. Kept as a constant so the two
+// modes are always labelled the same way everywhere in the UI.
+const MODE_LABELS: Record<string, string> = {
+  bedrock: 'BEDROCK AGENT MODE',
+  deterministic: 'DETERMINISTIC OFFLINE MODE',
+};
 
 const TIMELINE_STAGES = [
   'DETECTED',
@@ -133,7 +219,7 @@ export default function AIDoctorDashboard() {
       const res = await fetch('/api/demo/query', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt: 'Analyze patient emergency vitals' }),
+        body: JSON.stringify({ prompt: 'Analyze service health metrics' }),
       });
       const data = await res.json();
       if (res.ok) {
@@ -182,8 +268,23 @@ export default function AIDoctorDashboard() {
         body: JSON.stringify({ incident_id: latestIncident.incident_id }),
       });
       const data = await res.json();
+      // Every word here is read from what the backend actually verified. The
+      // previous text claimed "original request retried successfully" whenever the
+      // incident resolved, but RESOLVED only means the service came back - the
+      // replayed request can still have failed, or there may have been nothing
+      // captured to replay.
       if (data.outcome?.status === 'RESOLVED') {
-        setActionMessage(`Heal complete! Service verified on port 11434 and original request retried successfully.`);
+        const retry = data.outcome?.retry_result;
+        const verified = data.outcome?.verification;
+        const state = verified?.runtime_state ? ` (${verified.runtime_state})` : '';
+        const replay = !retry
+          ? 'No captured request was available to replay.'
+          : retry.success
+          ? `The original request was replayed and returned ${retry.status_code ?? 200}.`
+          : `The replayed request did NOT succeed (${
+              retry.error ?? retry.status_code ?? 'unknown'
+            }).`;
+        setActionMessage(`Service verified${state}. ${replay}`);
       } else {
         setActionMessage(`Healing attempted: ${data.outcome?.error || 'Verification pending'}`);
       }
@@ -401,6 +502,90 @@ export default function AIDoctorDashboard() {
           </motion.div>
         )}
 
+        {/* Diagnosis Engine Banner
+            Always visible, incident or not: the operator must be able to see at a
+            glance whether a foundation model or the offline rule engine is doing
+            the reasoning. Nothing here is inferred from an incident - it is read
+            straight from /api/system-status. */}
+        {status?.agent && (
+          <section
+            className={`rounded-2xl border p-4 shadow-xl ${
+              status.agent.mode_uses_llm && status.agent.llm_operational
+                ? 'bg-indigo-950/40 border-indigo-500/40'
+                : status.agent.mode_uses_llm
+                ? 'bg-amber-950/30 border-amber-500/40'
+                : 'bg-slate-900/80 border-slate-700'
+            }`}
+          >
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div className="flex items-start space-x-3">
+                <Cpu
+                  className={`w-5 h-5 mt-0.5 shrink-0 ${
+                    status.agent.mode_uses_llm && status.agent.llm_operational
+                      ? 'text-indigo-400'
+                      : status.agent.mode_uses_llm
+                      ? 'text-amber-400'
+                      : 'text-slate-400'
+                  }`}
+                />
+                <div>
+                  <div className="text-sm font-bold uppercase tracking-wider text-white">
+                    {MODE_LABELS[status.agent.agent_mode ?? ''] ??
+                      status.agent.agent_mode ??
+                      'UNKNOWN MODE'}
+                  </div>
+                  <p className="text-[11px] text-slate-400 font-mono mt-0.5">
+                    {status.agent.mode_uses_llm
+                      ? `Agent: AWS Strands + Amazon Bedrock${
+                          status.agent.model_id ? ` • Model: ${status.agent.model_id}` : ''
+                        }${status.agent.aws_region ? ` • Region: ${status.agent.aws_region}` : ''}`
+                      : 'Agent: offline deterministic rule engine (runner/diagnosis.py) • no model, no AWS call'}
+                  </p>
+                  <p className="text-[11px] text-slate-500 font-mono">
+                    {status.agent.strands_sdk_version
+                      ? `strands-agents ${status.agent.strands_sdk_version}`
+                      : 'strands-agents not installed'}
+                    {status.agent.boto3_version ? ` • boto3 ${status.agent.boto3_version}` : ''}
+                    {status.agent.fallback_policy
+                      ? ` • fallback: ${status.agent.fallback_policy}`
+                      : ''}
+                  </p>
+                </div>
+              </div>
+              <span
+                className={`px-2.5 py-1 text-[11px] font-bold rounded-md uppercase border ${
+                  status.agent.mode_uses_llm && status.agent.llm_operational
+                    ? 'bg-indigo-500/20 text-indigo-200 border-indigo-500/40'
+                    : status.agent.mode_uses_llm
+                    ? 'bg-amber-500/20 text-amber-200 border-amber-500/40'
+                    : 'bg-slate-800 text-slate-300 border-slate-700'
+                }`}
+              >
+                {status.agent.mode_uses_llm && status.agent.llm_operational
+                  ? 'Model Live'
+                  : status.agent.mode_uses_llm
+                  ? 'Model Not Reachable'
+                  : 'No Model'}
+              </span>
+            </div>
+
+            {(status.agent.warnings ?? []).length > 0 && (
+              <ul className="mt-3 space-y-1">
+                {(status.agent.warnings ?? []).map((w, i) => (
+                  <li
+                    key={i}
+                    className={`text-[11px] font-mono leading-relaxed ${
+                      status.agent.mode_uses_llm ? 'text-amber-200/90' : 'text-slate-400'
+                    }`}
+                  >
+                    • {w}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+        )}
+
         {/* Current Incident Section */}
         {latestIncident ? (
           <section className="bg-slate-900/70 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-6">
@@ -494,14 +679,81 @@ export default function AIDoctorDashboard() {
             {/* Root Cause & Remediation Summary Card */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <div className="bg-slate-950/80 border border-slate-800 rounded-xl p-4">
-                <div className="flex items-center space-x-2 text-xs font-bold uppercase text-amber-400 mb-2">
-                  <AlertCircle className="w-4 h-4" />
-                  <span>Deduce Root Cause</span>
+                <div className="flex items-center justify-between mb-2">
+                  <div className="flex items-center space-x-2 text-xs font-bold uppercase text-amber-400">
+                    <AlertCircle className="w-4 h-4" />
+                    <span>Deduce Root Cause</span>
+                  </div>
+                  {typeof latestIncident.confidence === 'number' && (
+                    <span className="text-[11px] font-mono text-slate-400">
+                      confidence {(latestIncident.confidence * 100).toFixed(0)}%
+                    </span>
+                  )}
                 </div>
                 <p className="text-xs text-slate-300 font-mono leading-relaxed">
                   {latestIncident.root_cause ||
                     'Awaiting diagnostic execution to analyze port, process, and socket telemetry.'}
                 </p>
+
+                {/* Provenance: who produced this conclusion. Rendered from the
+                    incident record itself, never from the UI's own assumption. */}
+                <div className="mt-3 pt-3 border-t border-slate-800 space-y-1 text-[11px] font-mono">
+                  <div className="text-slate-400">
+                    Diagnosis:{' '}
+                    <span
+                      className={
+                        latestIncident.used_llm
+                          ? 'text-indigo-300 font-bold'
+                          : latestIncident.agent_mode === 'bedrock'
+                          ? 'text-amber-300 font-bold'
+                          : 'text-slate-200 font-bold'
+                      }
+                    >
+                      {latestIncident.used_llm
+                        ? `AWS Strands + Amazon Bedrock${
+                            latestIncident.model_id ? ` (${latestIncident.model_id})` : ''
+                          }`
+                        : latestIncident.agent_mode === 'bedrock'
+                        ? latestIncident.diagnosis_outcome === 'FAILED'
+                          ? 'Amazon Bedrock was requested but produced no diagnosis'
+                          : 'Amazon Bedrock answered but returned no usable diagnosis'
+                        : 'deterministic rule engine (no model invoked)'}
+                    </span>
+                    {latestIncident.agent_status && (
+                      <span className="text-slate-500"> • {latestIncident.agent_status}</span>
+                    )}
+                  </div>
+                  {latestIncident.agent_mode === 'bedrock' && latestIncident.agent_telemetry && (
+                    <div className="text-slate-500">
+                      Evidence: {latestIncident.agent_telemetry.turns ?? 0} turn(s) •{' '}
+                      {latestIncident.agent_telemetry.tool_call_count ?? 0} tool call(s)
+                      {typeof latestIncident.agent_telemetry.total_tokens === 'number'
+                        ? ` • ${latestIncident.agent_telemetry.total_tokens} tokens`
+                        : ''}
+                      {latestIncident.agent_latency_ms
+                        ? ` • ${latestIncident.agent_latency_ms}ms`
+                        : ''}
+                    </div>
+                  )}
+                  {latestIncident.bedrock_failure && (
+                    <div className="text-amber-300/90 leading-relaxed">
+                      Bedrock unavailable
+                      {latestIncident.bedrock_failure.failure_kind
+                        ? ` [${latestIncident.bedrock_failure.failure_kind}]`
+                        : ''}{' '}
+                      ({latestIncident.bedrock_failure.error_class}) —{' '}
+                      {latestIncident.bedrock_failure.error_detail}
+                    </div>
+                  )}
+                  {latestIncident.requires_human && (
+                    <div className="text-rose-300 font-bold">
+                      Requires human intervention — no allowlisted action can fix this.
+                    </div>
+                  )}
+                  {latestIncident.agent_note && (
+                    <div className="text-slate-500 leading-relaxed">{latestIncident.agent_note}</div>
+                  )}
+                </div>
               </div>
 
               <div className="bg-slate-950/80 border border-slate-800 rounded-xl p-4">
@@ -516,13 +768,100 @@ export default function AIDoctorDashboard() {
                       <span className="text-emerald-400 font-bold">
                         {latestIncident.action_taken}()
                       </span>
-                      <br />
-                      Verification: Port 11434 restored (TCP OK) • HTTP 200 replayed
                     </>
                   ) : (
-                    'Remediation pending. AI Doctor allowlist strictly permits start_ollama and retry_request.'
+                    'Remediation pending. AI Doctor allowlist strictly permits start_ollama, retry_request and stop_ollama.'
                   )}
                 </p>
+
+                {/* Every line below is read from what actually happened. The
+                    previous version asserted "Port 11434 restored • HTTP 200
+                    replayed" unconditionally, which reported success for
+                    incidents that had failed. */}
+                <div className="mt-3 pt-3 border-t border-slate-800 space-y-1 text-[11px] font-mono">
+                  {latestIncident.policy_decision && (
+                    <div className="text-slate-400">
+                      Policy:{' '}
+                      <span
+                        className={
+                          latestIncident.policy_decision.allowed
+                            ? 'text-emerald-400 font-bold'
+                            : 'text-rose-400 font-bold'
+                        }
+                      >
+                        {latestIncident.policy_decision.allowed ? 'ALLOWED' : 'BLOCKED'}
+                      </span>
+                      {latestIncident.policy_decision.approved_action
+                        ? ` • ${latestIncident.policy_decision.approved_action}`
+                        : ''}
+                      {latestIncident.policy_decision.violation
+                        ? ` • ${latestIncident.policy_decision.violation}`
+                        : ''}
+                    </div>
+                  )}
+                  <div className="text-slate-400">
+                    Verification:{' '}
+                    {latestIncident.verification ? (
+                      <span
+                        className={
+                          latestIncident.verification.api_available
+                            ? 'text-emerald-400 font-bold'
+                            : 'text-rose-400 font-bold'
+                        }
+                      >
+                        {latestIncident.verification.api_available ? 'PASSED' : 'FAILED'}
+                      </span>
+                    ) : (
+                      <span className="text-slate-500">NOT RUN</span>
+                    )}
+                    {latestIncident.verification && (
+                      <span className="text-slate-500">
+                        {' '}
+                        • {latestIncident.verification.runtime_state} • port_open{' '}
+                        {String(latestIncident.verification.port_open)} • api{' '}
+                        {latestIncident.verification.api_status_code ?? 'n/a'}
+                      </span>
+                    )}
+                  </div>
+                  <div className="text-slate-400">
+                    Retry:{' '}
+                    {latestIncident.retry_result ? (
+                      <span
+                        className={
+                          latestIncident.retry_result.success
+                            ? 'text-emerald-400 font-bold'
+                            : 'text-rose-400 font-bold'
+                        }
+                      >
+                        {latestIncident.retry_result.success
+                          ? `REPLAYED OK (${latestIncident.retry_result.status_code ?? 200})`
+                          : `FAILED (${
+                              latestIncident.retry_result.error ??
+                              latestIncident.retry_result.status_code ??
+                              'unknown'
+                            })`}
+                      </span>
+                    ) : (
+                      <span className="text-slate-500">NO REQUEST CAPTURED</span>
+                    )}
+                  </div>
+                  <div className="text-slate-400">
+                    Recovery:{' '}
+                    <span
+                      className={
+                        latestIncident.status === 'RESOLVED'
+                          ? 'text-emerald-400 font-bold'
+                          : 'text-rose-400 font-bold'
+                      }
+                    >
+                      {latestIncident.status}
+                    </span>
+                    {latestIncident.action_result &&
+                      latestIncident.action_result.success === false && (
+                        <span className="text-rose-400"> • action reported failure</span>
+                      )}
+                  </div>
+                </div>
               </div>
             </div>
 
@@ -651,13 +990,31 @@ export default function AIDoctorDashboard() {
           </div>
 
           <div className="p-4 bg-slate-900/40 border border-slate-800/80 rounded-xl">
-            <div className="flex items-center space-x-2 text-indigo-400 font-bold mb-1">
+            <div
+              className={`flex items-center space-x-2 font-bold mb-1 ${
+                status?.agent?.llm_operational ? 'text-indigo-400' : 'text-slate-400'
+              }`}
+            >
               <Cpu className="w-4 h-4" />
-              <span>AWS Strands & Bedrock Ready</span>
+              {/* Read from /api/system-status, never asserted statically: "Ready"
+                  on a machine with no SDK and no credentials would be a lie the
+                  dashboard tells before anyone runs an incident. */}
+              <span>
+                {status?.agent?.llm_operational
+                  ? 'AWS Strands + Bedrock Operational'
+                  : status?.agent?.mode_uses_llm
+                  ? 'AWS Strands + Bedrock Not Operational'
+                  : 'AWS Strands + Bedrock Not Configured'}
+              </span>
             </div>
             <p className="text-slate-400 leading-relaxed">
-              Clean contracts ready for Phase 2 Strands Agent runtime and Amazon Bedrock (Claude
-              3.5 Sonnet) reasoning.
+              {status?.agent?.llm_operational
+                ? `Real agent runtime: ${status.agent.provider ?? 'AWS Strands'}${
+                    status.agent.model_id ? ` • ${status.agent.model_id}` : ''
+                  }${status.agent.aws_region ? ` • ${status.agent.aws_region}` : ''}.`
+                : status?.agent?.mode_uses_llm
+                ? 'Bedrock mode is configured but cannot be used right now. Incidents will say so explicitly rather than presenting a rule-engine result as a model diagnosis.'
+                : 'Deterministic offline mode: no model is invoked and no AWS call is made. Set AI_DOCTOR_AGENT_MODE=bedrock with credentials to use the real agent.'}
             </p>
           </div>
 
@@ -667,8 +1024,9 @@ export default function AIDoctorDashboard() {
               <span>DynamoDB Schema Compatible</span>
             </div>
             <p className="text-slate-400 leading-relaxed">
-              Incident records strictly match the DynamoDB table specification with sort keys and
-              status GSIs.
+              Incident records are shaped for the DynamoDB table specification (sort keys and status
+              GSIs), but nothing is deployed: no Lambda, API Gateway or DynamoDB table exists. The
+              local Bedrock path is validated first.
             </p>
           </div>
         </section>

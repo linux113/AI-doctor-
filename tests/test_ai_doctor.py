@@ -3,6 +3,22 @@ Unit and integration tests for AI Doctor and DeepTeam guardrails.
 """
 
 import pytest
+
+# The medical-triage assistant under ai_doctor/ is a separate, optional
+# component that depends on deepeval/deepteam. Those are heavy (deepteam
+# installs from a git remote) and are not needed by the autonomous recovery
+# agent under runner/ + backend/.
+#
+# Without this guard the module fails at *collection* time with
+# ModuleNotFoundError, which aborts the whole run - including the 18 recovery
+# agent tests that have nothing to do with deepeval. Skipping keeps
+# `pytest tests/` usable in a minimal environment while still running these 7
+# tests wherever the red-team extra is installed.
+pytest.importorskip(
+    "deepeval",
+    reason="deepeval/deepteam not installed (pip install -r requirements.txt)",
+)
+
 from fastapi.testclient import TestClient
 from ai_doctor.assistant import AIDoctorAssistant
 from ai_doctor.guardrails import get_ai_doctor_guardrails

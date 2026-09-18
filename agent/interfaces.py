@@ -1,72 +1,46 @@
 """
-Agent Interfaces & Protocols for AI Doctor.
-Defines clean contracts for the future AWS Strands Agents + Amazon Bedrock integration.
-DO NOT fake AWS integration: clean dataclasses and interfaces ready for AWS Phase 2.
+Plain data holders for the agent layer.
+
+This module used to declare `BedrockClientInterface` and `StrandsAgentInterface`
+- abstractions whose only implementation was a local placeholder. Those were
+removed: the real integration lives in `agent/strands_agent.py` and talks to the
+actual AWS Strands Agents SDK, so an interface that could be satisfied without
+touching AWS was a way to hide that fact rather than a way to extend the system.
+
+What remains here are value objects with no behaviour to fake.
 """
 
-from abc import ABC, abstractmethod
-from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, field
-from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
 class IncidentContext:
+    """Incident metadata handed to the agent. Error text arrives pre-redacted."""
+
     incident_id: str
     error_message: str
-    http_status: int
-    service: str
-    timestamp: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
-    request_url: Optional[str] = None
-    request_payload: Optional[Dict[str, Any]] = None
+    http_status: Optional[int] = None
+    service: str = "unknown"
 
 
 @dataclass
 class DiagnosticReport:
-    incident_id: str
-    evidence: Dict[str, Any]
+    """Diagnosis summary. `recommended_action` is a suggestion only."""
+
     detected_root_cause: str
-    confidence_score: float
     recommended_action: str
-    created_at: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
+    confidence_score: float
+    evidence: Dict[str, Any] = field(default_factory=dict)
+    contradictory_evidence: List[str] = field(default_factory=list)
+    notes: Optional[str] = None
 
-
-class BedrockClientInterface(ABC):
-    """
-    Interface for Amazon Bedrock foundation model invocations (Claude 3.5 Sonnet / Llama 3).
-    To be wired in Phase 2 via boto3.client('bedrock-runtime').
-    """
-
-    @abstractmethod
-    def invoke_model(
-        self,
-        prompt: str,
-        model_id: str = "anthropic.claude-3-5-sonnet-20241022-v2:0",
-        system_prompt: Optional[str] = None,
-        max_tokens: int = 1024,
-        temperature: float = 0.1,
-    ) -> Dict[str, Any]:
-        """Invoke an Amazon Bedrock foundation model with structured inputs."""
-        pass
-
-
-class StrandsAgentInterface(ABC):
-    """
-    Interface for AWS Strands Agents orchestration framework.
-    To be wired in Phase 2 with AWS Agent Runtime and action groups.
-    """
-
-    @abstractmethod
-    def plan_investigation(self, context: IncidentContext) -> List[str]:
-        """Plans the sequence of safe diagnostic tools to execute."""
-        pass
-
-    @abstractmethod
-    def evaluate_root_cause(self, context: IncidentContext, evidence: Dict[str, Any]) -> DiagnosticReport:
-        """Evaluates collected evidence against the incident symptoms to determine root cause."""
-        pass
-
-    @abstractmethod
-    def select_remediation(self, report: DiagnosticReport, allowlist: List[str]) -> str:
-        """Selects an approved remediation action strictly adhering to the allowlist."""
-        pass
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "detected_root_cause": self.detected_root_cause,
+            "recommended_action": self.recommended_action,
+            "confidence_score": self.confidence_score,
+            "evidence": self.evidence,
+            "contradictory_evidence": self.contradictory_evidence,
+            "notes": self.notes,
+        }
