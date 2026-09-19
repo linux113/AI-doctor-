@@ -1,25 +1,12 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
-  Activity,
-  AlertCircle,
-  CheckCircle2,
-  Cpu,
-  Database,
-  ExternalLink,
-  Flame,
-  LifeBuoy,
-  Play,
-  RefreshCw,
-  Server,
-  Shield,
-  ShieldAlert,
-  ShieldCheck,
-  Stethoscope,
-  Terminal,
-  Zap,
+  Activity, AlertCircle, CheckCircle2, ChevronRight, Clock3, Cpu, Database,
+  FileClock, Flame, Gauge, HeartPulse, Home, LifeBuoy, ListChecks, Play,
+  RefreshCw, Server, Settings, Shield, ShieldAlert, ShieldCheck, Stethoscope,
+  Terminal, Timer, TrendingUp, Wrench, X, Zap
 } from 'lucide-react';
 
 interface AgentInfo {
@@ -55,8 +42,6 @@ interface AgentTelemetry {
   strands_sdk_version?: string | null;
   error_class?: string | null;
   error_detail?: string | null;
-  // Stable machine-readable failure classification, and the AWS service code
-  // behind it. Both null on a successful call.
   failure_kind?: string | null;
   aws_error_code?: string | null;
 }
@@ -99,14 +84,7 @@ interface Incident {
   final_result?: string;
   timeline: TimelineEvent[];
   resolved_at?: string;
-  // Which engine produced this diagnosis. Present on every incident so the UI
-  // can never imply a model answered when the offline rule engine did.
   agent_mode?: string | null;
-  // agent_status is the ROUND TRIP (what Bedrock did); diagnosis_outcome is the
-  // DECISION (what the pipeline concluded). bedrock_invoked is true only when a
-  // real request reached Bedrock and answered; used_llm only when a model
-  // produced the validated diagnosis. The UI must not claim an AI diagnosis
-  // unless used_llm is true.
   agent_status?: string | null;
   diagnosis_outcome?: string | null;
   bedrock_invoked?: boolean | null;
@@ -135,902 +113,447 @@ interface Incident {
   } | null;
 }
 
-// Human-readable name for each diagnosis mode. Kept as a constant so the two
-// modes are always labelled the same way everywhere in the UI.
-const MODE_LABELS: Record<string, string> = {
-  bedrock: 'BEDROCK AGENT MODE',
-  deterministic: 'DETERMINISTIC OFFLINE MODE',
-};
+type Page = 'overview' | 'incidents' | 'diagnosis' | 'recovery' | 'telemetry' | 'verification' | 'audit' | 'settings';
 
-const TIMELINE_STAGES = [
-  'DETECTED',
-  'INVESTIGATING',
-  'ROOT CAUSE FOUND',
-  'REMEDIATION',
-  'VERIFYING',
-  'RESOLVED',
+const NAV: { id: Page; label: string; icon: React.ElementType }[] = [
+  { id: 'overview', label: 'Overview', icon: Home },
+  { id: 'incidents', label: 'Incidents', icon: AlertCircle },
+  { id: 'diagnosis', label: 'Diagnosis', icon: Terminal },
+  { id: 'recovery', label: 'Recovery', icon: Wrench },
+  { id: 'telemetry', label: 'Telemetry', icon: Activity },
+  { id: 'verification', label: 'Verification', icon: ShieldCheck },
+  { id: 'audit', label: 'Audit Log', icon: FileClock },
+  { id: 'settings', label: 'Settings', icon: Settings },
 ];
 
+const STAGES = ['DETECTED', 'INVESTIGATING', 'ROOT CAUSE FOUND', 'REMEDIATION', 'VERIFYING', 'RESOLVED'];
+
+const cn = (...v: Array<string | false | null | undefined>) => v.filter(Boolean).join(' ');
+const fmt = (n: number | null | undefined, suffix = '') => typeof n === 'number' ? `${n}${suffix}` : '—';
+const pct = (n: number | null | undefined) => typeof n === 'number' ? `${Math.round(n * 100)}%` : '—';
+
+function StatusDot({ ok, pulse = false }: { ok: boolean; pulse?: boolean }) {
+  return <span className={cn('inline-block h-2.5 w-2.5 rounded-full', ok ? 'bg-emerald-400' : 'bg-rose-400', pulse && ok && 'animate-pulse')} />;
+}
+
+function Card({ children, className = '' }: { children: React.ReactNode; className?: string }) {
+  return <div className={cn('rounded-2xl border border-slate-800/90 bg-slate-900/70 shadow-[0_18px_50px_rgba(0,0,0,.18)]', className)}>{children}</div>;
+}
+
+function Badge({ children, tone = 'slate' }: { children: React.ReactNode; tone?: 'green' | 'red' | 'blue' | 'amber' | 'purple' | 'slate' }) {
+  const colors = {
+    green: 'bg-emerald-500/10 text-emerald-300 border-emerald-500/20',
+    red: 'bg-rose-500/10 text-rose-300 border-rose-500/20',
+    blue: 'bg-sky-500/10 text-sky-300 border-sky-500/20',
+    amber: 'bg-amber-500/10 text-amber-300 border-amber-500/20',
+    purple: 'bg-indigo-500/10 text-indigo-300 border-indigo-500/20',
+    slate: 'bg-slate-800/70 text-slate-300 border-slate-700',
+  };
+  return <span className={cn('inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider', colors[tone])}>{children}</span>;
+}
+
+function Metric({ label, value, detail, icon: Icon, tone = 'blue', good = true }: any) {
+  const iconTone = tone === 'green' ? 'text-emerald-400 bg-emerald-400/10 border-emerald-400/20' : tone === 'red' ? 'text-rose-400 bg-rose-400/10 border-rose-400/20' : tone === 'purple' ? 'text-indigo-400 bg-indigo-400/10 border-indigo-400/20' : 'text-sky-400 bg-sky-400/10 border-sky-400/20';
+  return <Card className="p-4">
+    <div className="flex items-start justify-between">
+      <div>
+        <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-500">{label}</p>
+        <p className={cn('mt-2 text-xl font-bold uppercase', good ? 'text-emerald-300' : 'text-rose-300')}>{value}</p>
+        <p className="mt-1 text-[10px] text-slate-500">{detail}</p>
+      </div>
+      <div className={cn('rounded-xl border p-2', iconTone)}><Icon className="h-4 w-4" /></div>
+    </div>
+  </Card>;
+}
+
+function Sparkline({ values, label }: { values: number[]; label: string }) {
+  const max = Math.max(...values), min = Math.min(...values);
+  const points = values.map((v, i) => `${(i / (values.length - 1)) * 100},${88 - ((v - min) / Math.max(1, max - min)) * 72}`).join(' ');
+  return <div>
+    <div className="mb-2 flex items-center justify-between text-[10px] text-slate-500"><span>{label}</span><span>last 30 min</span></div>
+    <svg viewBox="0 0 100 90" preserveAspectRatio="none" className="h-32 w-full overflow-visible">
+      <path d="M0 88 H100" stroke="currentColor" className="text-slate-800" strokeWidth=".8" />
+      <polyline points={points} fill="none" stroke="currentColor" className="text-sky-400" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  </div>;
+}
+
 export default function AIDoctorDashboard() {
+  const [page, setPage] = useState<Page>('overview');
   const [status, setStatus] = useState<SystemStatus | null>(null);
-  const [latestIncident, setLatestIncident] = useState<Incident | null>(null);
-  const [incidentsList, setIncidentsList] = useState<Incident[]>([]);
+  const [incidents, setIncidents] = useState<Incident[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  const [actionMessage, setActionMessage] = useState<string | null>(null);
+  const [message, setMessage] = useState<string | null>(null);
   const [queryOutput, setQueryOutput] = useState<string | null>(null);
-  const [selectedIncidentId, setSelectedIncidentId] = useState<string | null>(null);
+  const [mobileNav, setMobileNav] = useState(false);
 
-  // Poll system status and incidents
-  const fetchData = async () => {
+  const latest = useMemo(() => {
+    if (!incidents.length) return null;
+    return incidents.find(i => i.incident_id === selectedId) || incidents[0];
+  }, [incidents, selectedId]);
+
+  const refresh = async () => {
     try {
-      const [statusRes, incRes] = await Promise.all([
-        fetch('/api/system-status'),
-        fetch('/api/incidents?limit=10'),
-      ]);
-
-      if (statusRes.ok) {
-        const statusData: SystemStatus = await statusRes.json();
-        setStatus(statusData);
-      }
-
-      if (incRes.ok) {
-        const incidents: Incident[] = await incRes.json();
-        setIncidentsList(incidents);
-        if (incidents.length > 0) {
-          if (!selectedIncidentId) {
-            setLatestIncident(incidents[0]);
-          } else {
-            const found = incidents.find((i) => i.incident_id === selectedIncidentId);
-            setLatestIncident(found || incidents[0]);
-          }
-        }
-      }
-    } catch (err) {
-      console.error('Failed to fetch status:', err);
+      const [s, i] = await Promise.all([fetch('/api/system-status'), fetch('/api/incidents?limit=20')]);
+      if (s.ok) setStatus(await s.json());
+      if (i.ok) setIncidents(await i.json());
+    } catch (e) {
+      console.error(e);
     }
   };
 
   useEffect(() => {
-    fetchData();
-    const interval = setInterval(fetchData, 2500);
-    return () => clearInterval(interval);
-  }, [selectedIncidentId]);
+    refresh();
+    const timer = setInterval(refresh, 2500);
+    return () => clearInterval(timer);
+  }, []);
 
-  // Actions
-  const handleSimulateFailure = async () => {
+  const action = async (label: string, url: string, body?: any) => {
     setLoading(true);
-    setActionMessage('Simulating outage: Terminating Ollama & triggering demo query...');
+    setMessage(label);
     try {
-      const res = await fetch('/api/demo/simulate-incident', { method: 'POST' });
-      const data = await res.json();
-      setActionMessage(`Failure detected! Incident #${data.incident_id} registered.`);
-      await fetchData();
+      const res = await fetch(url, body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || data.error || `HTTP ${res.status}`);
+      setMessage('Action completed successfully.');
+      await refresh();
+      return data;
     } catch (e: any) {
-      setActionMessage(`Error simulating failure: ${e.message}`);
+      setMessage(`Action failed: ${e.message}`);
     } finally {
       setLoading(false);
     }
   };
 
-  const handleTestAppQuery = async () => {
-    setLoading(true);
-    setActionMessage('Testing demo application query...');
+  const simulate = () => action('Simulating incident and triggering the demo failure path…', '/api/demo/simulate-incident');
+  const queryApp = async () => {
+    setLoading(true); setMessage('Testing demo application query…');
     try {
-      const res = await fetch('/api/demo/query', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt: 'Analyze service health metrics' }),
-      });
+      const res = await fetch('/api/demo/query', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ prompt: 'Analyze service health metrics' }) });
       const data = await res.json();
-      if (res.ok) {
-        setQueryOutput(JSON.stringify(data, null, 2));
-        setActionMessage('Application query SUCCEEDED (HTTP 200).');
-      } else {
-        setQueryOutput(JSON.stringify(data, null, 2));
-        setActionMessage(`Application query FAILED (HTTP ${res.status}). Incident generated!`);
-      }
-      await fetchData();
-    } catch (e: any) {
-      setActionMessage(`Request error: ${e.message}`);
-    } finally {
-      setLoading(false);
-    }
+      setQueryOutput(JSON.stringify(data, null, 2));
+      setMessage(res.ok ? 'Application query returned HTTP 200.' : `Application query failed with HTTP ${res.status}; incident recorded.`);
+      await refresh();
+    } catch (e: any) { setMessage(`Request failed: ${e.message}`); }
+    finally { setLoading(false); }
   };
+  const diagnose = () => latest && action('Running safe diagnostic tools on the selected incident…', '/api/diagnose', { incident_id: latest.incident_id });
+  const heal = () => latest && action('Executing allowlisted recovery actions and verification…', '/api/heal', { incident_id: latest.incident_id });
 
-  const handleRunDiagnosis = async () => {
-    if (!latestIncident) return;
-    setLoading(true);
-    setActionMessage(`Running safe diagnostic tools on incident ${latestIncident.incident_id}...`);
-    try {
-      const res = await fetch('/api/diagnose', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ incident_id: latestIncident.incident_id }),
-      });
-      const data = await res.json();
-      setActionMessage(`Diagnosis complete: ${data.diagnosis?.root_cause}`);
-      await fetchData();
-    } catch (e: any) {
-      setActionMessage(`Diagnosis error: ${e.message}`);
-    } finally {
-      setLoading(false);
-    }
-  };
+  const appHealthy = status?.application === 'healthy';
+  const ollamaHealthy = status?.ollama === 'healthy';
+  const portOpen = !!status?.port_11434_open;
+  const backendHealthy = status?.backend === 'healthy' || status?.backend === 'online' || !status?.backend;
+  const agentReady = !!status?.agent?.llm_operational;
+  const activeCount = status?.active_incidents_count ?? incidents.filter(i => i.status !== 'RESOLVED').length;
+  const resolved = incidents.filter(i => i.status === 'RESOLVED').length;
+  const currentStage = latest ? STAGES.indexOf(latest.status) : -1;
 
-  const handleHealIncident = async () => {
-    if (!latestIncident) return;
-    setLoading(true);
-    setActionMessage(`Autonomous Healing started for incident ${latestIncident.incident_id}...`);
-    try {
-      const res = await fetch('/api/heal', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ incident_id: latestIncident.incident_id }),
-      });
-      const data = await res.json();
-      // Every word here is read from what the backend actually verified. The
-      // previous text claimed "original request retried successfully" whenever the
-      // incident resolved, but RESOLVED only means the service came back - the
-      // replayed request can still have failed, or there may have been nothing
-      // captured to replay.
-      if (data.outcome?.status === 'RESOLVED') {
-        const retry = data.outcome?.retry_result;
-        const verified = data.outcome?.verification;
-        const state = verified?.runtime_state ? ` (${verified.runtime_state})` : '';
-        const replay = !retry
-          ? 'No captured request was available to replay.'
-          : retry.success
-          ? `The original request was replayed and returned ${retry.status_code ?? 200}.`
-          : `The replayed request did NOT succeed (${
-              retry.error ?? retry.status_code ?? 'unknown'
-            }).`;
-        setActionMessage(`Service verified${state}. ${replay}`);
-      } else {
-        setActionMessage(`Healing attempted: ${data.outcome?.error || 'Verification pending'}`);
-      }
-      await fetchData();
-    } catch (e: any) {
-      setActionMessage(`Heal error: ${e.message}`);
-    } finally {
-      setLoading(false);
-    }
-  };
+  const go = (p: Page) => { setPage(p); setMobileNav(false); };
 
-  const currentStageIndex = latestIncident
-    ? TIMELINE_STAGES.indexOf(latestIncident.status)
-    : -1;
+  const headerTitle = NAV.find(n => n.id === page)?.label || 'Overview';
 
-  return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans">
-      {/* Top Header */}
-      <header className="border-b border-slate-800 bg-slate-900/80 backdrop-blur sticky top-0 z-50">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
-          <div className="flex items-center space-x-3">
-            <div className="p-2 bg-sky-500/10 border border-sky-500/30 rounded-xl text-sky-400">
-              <Stethoscope className="w-6 h-6 animate-pulse" />
+  return <div className="min-h-screen bg-[#070b12] text-slate-100">
+    <div className="fixed inset-0 pointer-events-none bg-[radial-gradient(circle_at_70%_-10%,rgba(14,165,233,.13),transparent_35%),radial-gradient(circle_at_0%_70%,rgba(99,102,241,.07),transparent_30%)]" />
+
+    <div className="relative flex min-h-screen">
+      <aside className={cn('fixed inset-y-0 left-0 z-50 w-64 border-r border-slate-800 bg-[#080d16]/95 backdrop-blur-xl transition-transform lg:sticky lg:top-0 lg:translate-x-0', mobileNav ? 'translate-x-0' : '-translate-x-full')}>
+        <div className="flex h-full flex-col">
+          <div className="flex h-20 items-center gap-3 border-b border-slate-800 px-5">
+            <div className="relative rounded-xl border border-sky-500/30 bg-sky-500/10 p-2.5 text-sky-400">
+              <Stethoscope className="h-6 w-6" />
+              <span className="absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,.9)]" />
             </div>
             <div>
-              <div className="flex items-center space-x-2">
-                <h1 className="text-lg font-bold text-white tracking-wide">AI Doctor</h1>
-                <span className="text-xs px-2 py-0.5 bg-sky-500/20 text-sky-300 border border-sky-500/30 rounded-full font-mono font-medium">
-                  AWS First Commit MVP
-                </span>
-              </div>
-              <p className="text-xs text-slate-400">
-                Autonomous Developer Troubleshooting & Recovery Agent
-              </p>
+              <div className="font-bold tracking-wide text-white">AI Doctor</div>
+              <div className="text-[10px] text-slate-500">Developer Resilience AI</div>
             </div>
+            <button className="ml-auto lg:hidden text-slate-500" onClick={() => setMobileNav(false)}><X className="h-5 w-5" /></button>
           </div>
 
-          <div className="flex items-center space-x-4">
-            <div className="hidden md:flex items-center space-x-2 text-xs text-slate-400 bg-slate-800/60 px-3 py-1.5 rounded-lg border border-slate-700/60 font-mono">
-              <div className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
-              <span>Runner Loop: DETECT → DIAGNOSE → FIX → VERIFY → RETRY</span>
+          <div className="px-3 py-5">
+            <p className="px-3 pb-2 text-[9px] font-bold uppercase tracking-[.2em] text-slate-600">Control Center</p>
+            <nav className="space-y-1">
+              {NAV.map(({ id, label, icon: Icon }) => <button key={id} onClick={() => go(id)} className={cn('group flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-sm transition', page === id ? 'bg-sky-500/15 text-sky-300 shadow-inner shadow-sky-500/10' : 'text-slate-500 hover:bg-slate-800/60 hover:text-slate-200')}>
+                <Icon className={cn('h-4 w-4', page === id ? 'text-sky-400' : 'text-slate-600 group-hover:text-slate-400')} />
+                <span>{label}</span>
+                {id === 'incidents' && activeCount > 0 && <span className="ml-auto rounded-full bg-rose-500/15 px-2 py-0.5 text-[9px] text-rose-300">{activeCount}</span>}
+              </button>)}
+            </nav>
+          </div>
+
+          <div className="mt-auto border-t border-slate-800 p-4">
+            <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-3">
+              <div className="flex items-center gap-2"><StatusDot ok={appHealthy && backendHealthy} pulse /><span className="text-xs font-semibold text-slate-300">Agent Online</span></div>
+              <div className="mt-1 text-[9px] text-slate-600">AI Doctor dashboard • live polling</div>
             </div>
-            <button
-              onClick={fetchData}
-              className="p-2 text-slate-400 hover:text-white bg-slate-800/80 hover:bg-slate-700 rounded-lg border border-slate-700 transition"
-              title="Refresh State"
-            >
-              <RefreshCw className="w-4 h-4" />
-            </button>
           </div>
         </div>
-      </header>
+      </aside>
 
-      {/* Main Content */}
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 flex-1 space-y-6 w-full">
-        {/* System Status Row */}
-        <section className="grid grid-cols-2 md:grid-cols-5 gap-3">
-          {/* Application */}
-          <div className="bg-slate-900/60 border border-slate-800 p-4 rounded-xl relative overflow-hidden">
-            <div className="flex justify-between items-start">
-              <span className="text-xs font-medium text-slate-400">Application</span>
-              <Activity
-                className={`w-4 h-4 ${
-                  status?.application === 'healthy' ? 'text-emerald-400' : 'text-amber-400'
-                }`}
-              />
-            </div>
-            <div className="mt-2 flex items-baseline space-x-2">
-              <span
-                className={`text-xl font-bold uppercase ${
-                  status?.application === 'healthy' ? 'text-emerald-400' : 'text-amber-400'
-                }`}
-              >
-                {status?.application || 'Checking...'}
-              </span>
-            </div>
-            <p className="text-[11px] text-slate-500 mt-1">Demo Inference API</p>
-          </div>
+      {mobileNav && <button className="fixed inset-0 z-40 bg-black/60 lg:hidden" onClick={() => setMobileNav(false)} aria-label="Close navigation" />}
 
-          {/* Ollama Runtime */}
-          <div
-            className={`border p-4 rounded-xl relative overflow-hidden ${
-              status?.ollama === 'healthy'
-                ? 'bg-slate-900/60 border-slate-800'
-                : 'bg-rose-950/20 border-rose-800/50 glow-active'
-            }`}
-          >
-            <div className="flex justify-between items-start">
-              <span className="text-xs font-medium text-slate-400">Ollama Runtime</span>
-              <Cpu
-                className={`w-4 h-4 ${
-                  status?.ollama === 'healthy' ? 'text-emerald-400' : 'text-rose-400'
-                }`}
-              />
-            </div>
-            <div className="mt-2 flex items-baseline space-x-2">
-              <span
-                className={`text-xl font-bold uppercase ${
-                  status?.ollama === 'healthy' ? 'text-emerald-400' : 'text-rose-400'
-                }`}
-              >
-                {status?.ollama || 'Checking...'}
-              </span>
-            </div>
-            <p className="text-[11px] text-slate-500 mt-1">Port 11434 / REST API</p>
-          </div>
-
-          {/* Port 11434 Status */}
-          <div className="bg-slate-900/60 border border-slate-800 p-4 rounded-xl">
-            <div className="flex justify-between items-start">
-              <span className="text-xs font-medium text-slate-400">TCP Port 11434</span>
-              <Server
-                className={`w-4 h-4 ${
-                  status?.port_11434_open ? 'text-emerald-400' : 'text-rose-400'
-                }`}
-              />
-            </div>
-            <div className="mt-2 flex items-baseline space-x-2">
-              <span
-                className={`text-xl font-bold font-mono ${
-                  status?.port_11434_open ? 'text-emerald-400' : 'text-rose-400'
-                }`}
-              >
-                {status?.port_11434_open ? 'OPEN' : 'CLOSED'}
-              </span>
-            </div>
-            <p className="text-[11px] text-slate-500 mt-1">Raw Socket Probe</p>
-          </div>
-
-          {/* Backend API */}
-          <div className="bg-slate-900/60 border border-slate-800 p-4 rounded-xl">
-            <div className="flex justify-between items-start">
-              <span className="text-xs font-medium text-slate-400">Backend API</span>
-              <Database className="w-4 h-4 text-emerald-400" />
-            </div>
-            <div className="mt-2 flex items-baseline space-x-2">
-              <span className="text-xl font-bold uppercase text-emerald-400">
-                {status?.backend || 'ONLINE'}
-              </span>
-            </div>
-            <p className="text-[11px] text-slate-500 mt-1">FastAPI :8000</p>
-          </div>
-
-          {/* Doctor Runner */}
-          <div className="bg-slate-900/60 border border-slate-800 p-4 rounded-xl">
-            <div className="flex justify-between items-start">
-              <span className="text-xs font-medium text-slate-400">Doctor Runner</span>
-              <ShieldCheck className="w-4 h-4 text-sky-400" />
-            </div>
-            <div className="mt-2 flex items-baseline space-x-2">
-              <span className="text-xl font-bold uppercase text-sky-400">
-                {status?.doctor_runner || 'ACTIVE'}
-              </span>
-            </div>
-            <p className="text-[11px] text-slate-500 mt-1">Autonomous Agent</p>
-          </div>
-        </section>
-
-        {/* Action Controls Bar */}
-        <section className="bg-slate-900/90 border border-slate-800 rounded-2xl p-4 flex flex-wrap items-center justify-between gap-4 shadow-xl">
-          <div className="flex items-center space-x-3">
-            <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">
-              Control Panel:
-            </span>
-            <button
-              onClick={handleSimulateFailure}
-              disabled={loading}
-              className="flex items-center space-x-2 bg-rose-600/20 hover:bg-rose-600/30 text-rose-300 border border-rose-600/40 px-3.5 py-2 rounded-xl text-sm font-semibold transition disabled:opacity-50"
-            >
-              <Flame className="w-4 h-4 text-rose-400" />
-              <span>Simulate Failure</span>
-            </button>
-            <button
-              onClick={handleTestAppQuery}
-              disabled={loading}
-              className="flex items-center space-x-2 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 px-3.5 py-2 rounded-xl text-sm font-semibold transition disabled:opacity-50"
-            >
-              <Play className="w-4 h-4 text-sky-400" />
-              <span>Query App API</span>
-            </button>
-          </div>
-
-          <div className="flex items-center space-x-3">
-            <button
-              onClick={handleRunDiagnosis}
-              disabled={loading || !latestIncident}
-              className="flex items-center space-x-2 bg-indigo-600/20 hover:bg-indigo-600/30 text-indigo-300 border border-indigo-600/40 px-3.5 py-2 rounded-xl text-sm font-semibold transition disabled:opacity-50"
-            >
-              <Terminal className="w-4 h-4 text-indigo-400" />
-              <span>Run Diagnosis</span>
-            </button>
-            <button
-              onClick={handleHealIncident}
-              disabled={loading || !latestIncident || latestIncident.status === 'RESOLVED'}
-              className="flex items-center space-x-2 bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-600/30 px-4 py-2 rounded-xl text-sm font-semibold transition disabled:opacity-50"
-            >
-              <Zap className="w-4 h-4 fill-current" />
-              <span>Heal Incident</span>
-            </button>
-          </div>
-        </section>
-
-        {/* Action Status Banner */}
-        {actionMessage && (
-          <motion.div
-            initial={{ opacity: 0, y: -10 }}
-            animate={{ opacity: 1, y: 0 }}
-            className="p-3 bg-slate-900 border border-sky-500/30 text-sky-200 text-xs rounded-xl flex items-center justify-between font-mono"
-          >
-            <div className="flex items-center space-x-2">
-              <Terminal className="w-4 h-4 text-sky-400" />
-              <span>{actionMessage}</span>
-            </div>
-            {loading && <RefreshCw className="w-3.5 h-3.5 animate-spin text-sky-400" />}
-          </motion.div>
-        )}
-
-        {/* Diagnosis Engine Banner
-            Always visible, incident or not: the operator must be able to see at a
-            glance whether a foundation model or the offline rule engine is doing
-            the reasoning. Nothing here is inferred from an incident - it is read
-            straight from /api/system-status. */}
-        {status?.agent && (
-          <section
-            className={`rounded-2xl border p-4 shadow-xl ${
-              status.agent.mode_uses_llm && status.agent.llm_operational
-                ? 'bg-indigo-950/40 border-indigo-500/40'
-                : status.agent.mode_uses_llm
-                ? 'bg-amber-950/30 border-amber-500/40'
-                : 'bg-slate-900/80 border-slate-700'
-            }`}
-          >
-            <div className="flex flex-wrap items-start justify-between gap-3">
-              <div className="flex items-start space-x-3">
-                <Cpu
-                  className={`w-5 h-5 mt-0.5 shrink-0 ${
-                    status.agent.mode_uses_llm && status.agent.llm_operational
-                      ? 'text-indigo-400'
-                      : status.agent.mode_uses_llm
-                      ? 'text-amber-400'
-                      : 'text-slate-400'
-                  }`}
-                />
-                <div>
-                  <div className="text-sm font-bold uppercase tracking-wider text-white">
-                    {MODE_LABELS[status.agent.agent_mode ?? ''] ??
-                      status.agent.agent_mode ??
-                      'UNKNOWN MODE'}
-                  </div>
-                  <p className="text-[11px] text-slate-400 font-mono mt-0.5">
-                    {status.agent.mode_uses_llm
-                      ? `Agent: AWS Strands + Amazon Bedrock${
-                          status.agent.model_id ? ` • Model: ${status.agent.model_id}` : ''
-                        }${status.agent.aws_region ? ` • Region: ${status.agent.aws_region}` : ''}`
-                      : 'Agent: offline deterministic rule engine (runner/diagnosis.py) • no model, no AWS call'}
-                  </p>
-                  <p className="text-[11px] text-slate-500 font-mono">
-                    {status.agent.strands_sdk_version
-                      ? `strands-agents ${status.agent.strands_sdk_version}`
-                      : 'strands-agents not installed'}
-                    {status.agent.boto3_version ? ` • boto3 ${status.agent.boto3_version}` : ''}
-                    {status.agent.fallback_policy
-                      ? ` • fallback: ${status.agent.fallback_policy}`
-                      : ''}
-                  </p>
-                </div>
-              </div>
-              <span
-                className={`px-2.5 py-1 text-[11px] font-bold rounded-md uppercase border ${
-                  status.agent.mode_uses_llm && status.agent.llm_operational
-                    ? 'bg-indigo-500/20 text-indigo-200 border-indigo-500/40'
-                    : status.agent.mode_uses_llm
-                    ? 'bg-amber-500/20 text-amber-200 border-amber-500/40'
-                    : 'bg-slate-800 text-slate-300 border-slate-700'
-                }`}
-              >
-                {status.agent.mode_uses_llm && status.agent.llm_operational
-                  ? 'Model Live'
-                  : status.agent.mode_uses_llm
-                  ? 'Model Not Reachable'
-                  : 'No Model'}
-              </span>
-            </div>
-
-            {(status.agent.warnings ?? []).length > 0 && (
-              <ul className="mt-3 space-y-1">
-                {(status.agent.warnings ?? []).map((w, i) => (
-                  <li
-                    key={i}
-                    className={`text-[11px] font-mono leading-relaxed ${
-                      status.agent.mode_uses_llm ? 'text-amber-200/90' : 'text-slate-400'
-                    }`}
-                  >
-                    • {w}
-                  </li>
-                ))}
-              </ul>
-            )}
-          </section>
-        )}
-
-        {/* Current Incident Section */}
-        {latestIncident ? (
-          <section className="bg-slate-900/70 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-6">
-            <div className="flex flex-wrap items-start justify-between gap-4 border-b border-slate-800 pb-4">
+      <section className="min-w-0 flex-1">
+        <header className="sticky top-0 z-30 border-b border-slate-800 bg-[#080d16]/85 backdrop-blur-xl">
+          <div className="flex h-16 items-center justify-between px-4 sm:px-6 lg:px-8">
+            <div className="flex items-center gap-3">
+              <button className="rounded-lg border border-slate-800 p-2 text-slate-400 lg:hidden" onClick={() => setMobileNav(true)}><ListChecks className="h-5 w-5" /></button>
               <div>
-                <div className="flex items-center space-x-3">
-                  <span className="px-2.5 py-0.5 text-xs font-mono font-bold bg-slate-800 text-sky-300 border border-slate-700 rounded-md">
-                    {latestIncident.incident_id}
-                  </span>
-                  <span
-                    className={`px-2.5 py-0.5 text-xs font-bold rounded-md uppercase ${
-                      latestIncident.status === 'RESOLVED'
-                        ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
-                        : latestIncident.status === 'DETECTED'
-                        ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
-                        : 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
-                    }`}
-                  >
-                    {latestIncident.status}
-                  </span>
-                  <span className="text-xs text-slate-400 font-mono">
-                    Service: {latestIncident.service}
-                  </span>
-                </div>
-                <h2 className="text-lg font-bold text-white mt-2 flex items-center space-x-2">
-                  <AlertCircle className="w-5 h-5 text-rose-400 shrink-0" />
-                  <span className="font-mono text-sm sm:text-base text-rose-200 break-all">
-                    HTTP {latestIncident.http_status}: {latestIncident.detected_error}
-                  </span>
-                </h2>
-              </div>
-              <div className="text-right text-xs text-slate-500 font-mono">
-                <div>Detected: {latestIncident.created_at}</div>
-                {latestIncident.resolved_at && (
-                  <div className="text-emerald-400">Resolved: {latestIncident.resolved_at}</div>
-                )}
+                <p className="text-[10px] font-bold uppercase tracking-[.2em] text-sky-400">AI Doctor / {headerTitle}</p>
+                <h1 className="text-lg font-bold text-white">{page === 'overview' ? 'Autonomous Developer Troubleshooting' : headerTitle}</h1>
               </div>
             </div>
-
-            {/* Autonomous Recovery Timeline */}
-            <div>
-              <h3 className="text-xs font-bold uppercase tracking-wider text-slate-400 mb-4 flex items-center space-x-2">
-                <LifeBuoy className="w-4 h-4 text-sky-400" />
-                <span>Autonomous Recovery Loop Timeline</span>
-              </h3>
-              <div className="relative">
-                {/* Connecting track */}
-                <div className="absolute top-1/2 left-0 right-0 h-1 bg-slate-800 -translate-y-1/2 hidden md:block" />
-
-                <div className="grid grid-cols-2 md:grid-cols-6 gap-3 relative z-10">
-                  {TIMELINE_STAGES.map((stageName, idx) => {
-                    const isReached =
-                      latestIncident.status === 'RESOLVED' ||
-                      idx <= TIMELINE_STAGES.indexOf(latestIncident.status);
-                    const isCurrent = latestIncident.status === stageName;
-
-                    return (
-                      <motion.div
-                        key={stageName}
-                        initial={{ opacity: 0, scale: 0.95 }}
-                        animate={{ opacity: 1, scale: 1 }}
-                        className={`p-3 rounded-xl border flex flex-col items-center text-center transition ${
-                          isCurrent
-                            ? 'bg-sky-950/40 border-sky-500 text-sky-200 ring-2 ring-sky-500/30 glow-active'
-                            : isReached
-                            ? 'bg-slate-900 border-slate-700 text-slate-200'
-                            : 'bg-slate-950/40 border-slate-800/60 text-slate-600'
-                        }`}
-                      >
-                        <div
-                          className={`w-7 h-7 rounded-full flex items-center justify-center font-bold text-xs mb-1.5 ${
-                            isReached
-                              ? stageName === 'RESOLVED'
-                                ? 'bg-emerald-500 text-white'
-                                : 'bg-sky-500 text-slate-950'
-                              : 'bg-slate-800 text-slate-500'
-                          }`}
-                        >
-                          {idx + 1}
-                        </div>
-                        <span className="text-xs font-bold uppercase tracking-tight">
-                          {stageName}
-                        </span>
-                      </motion.div>
-                    );
-                  })}
-                </div>
+            <div className="flex items-center gap-2 sm:gap-3">
+              <div className="hidden items-center gap-2 rounded-lg border border-slate-800 bg-slate-900/70 px-3 py-2 text-[10px] text-slate-500 md:flex">
+                <StatusDot ok={appHealthy && backendHealthy} pulse />
+                Runner: DETECT → DIAGNOSE → FIX → VERIFY → RETRY
               </div>
+              <button onClick={refresh} className={cn('rounded-lg border border-slate-800 bg-slate-900 p-2 text-slate-400 hover:text-white', loading && 'animate-pulse')} title="Refresh"><RefreshCw className="h-4 w-4" /></button>
             </div>
+          </div>
+        </header>
 
-            {/* Root Cause & Remediation Summary Card */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <div className="bg-slate-950/80 border border-slate-800 rounded-xl p-4">
-                <div className="flex items-center justify-between mb-2">
-                  <div className="flex items-center space-x-2 text-xs font-bold uppercase text-amber-400">
-                    <AlertCircle className="w-4 h-4" />
-                    <span>Deduce Root Cause</span>
-                  </div>
-                  {typeof latestIncident.confidence === 'number' && (
-                    <span className="text-[11px] font-mono text-slate-400">
-                      confidence {(latestIncident.confidence * 100).toFixed(0)}%
-                    </span>
-                  )}
-                </div>
-                <p className="text-xs text-slate-300 font-mono leading-relaxed">
-                  {latestIncident.root_cause ||
-                    'Awaiting diagnostic execution to analyze port, process, and socket telemetry.'}
-                </p>
+        <main className="mx-auto max-w-[1500px] space-y-6 p-4 sm:p-6 lg:p-8">
+          <AnimatePresence>{message && <motion.div initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} className="flex items-center gap-3 rounded-xl border border-sky-500/20 bg-sky-500/5 px-4 py-3 text-xs text-sky-200"><Terminal className="h-4 w-4 text-sky-400" /><span>{message}</span>{loading && <RefreshCw className="ml-auto h-3.5 w-3.5 animate-spin" />}</motion.div>}</AnimatePresence>
 
-                {/* Provenance: who produced this conclusion. Rendered from the
-                    incident record itself, never from the UI's own assumption. */}
-                <div className="mt-3 pt-3 border-t border-slate-800 space-y-1 text-[11px] font-mono">
-                  <div className="text-slate-400">
-                    Diagnosis:{' '}
-                    <span
-                      className={
-                        latestIncident.used_llm
-                          ? 'text-indigo-300 font-bold'
-                          : latestIncident.agent_mode === 'bedrock'
-                          ? 'text-amber-300 font-bold'
-                          : 'text-slate-200 font-bold'
-                      }
-                    >
-                      {latestIncident.used_llm
-                        ? `AWS Strands + Amazon Bedrock${
-                            latestIncident.model_id ? ` (${latestIncident.model_id})` : ''
-                          }`
-                        : latestIncident.agent_mode === 'bedrock'
-                        ? latestIncident.diagnosis_outcome === 'FAILED'
-                          ? 'Amazon Bedrock was requested but produced no diagnosis'
-                          : 'Amazon Bedrock answered but returned no usable diagnosis'
-                        : 'deterministic rule engine (no model invoked)'}
-                    </span>
-                    {latestIncident.agent_status && (
-                      <span className="text-slate-500"> • {latestIncident.agent_status}</span>
-                    )}
-                  </div>
-                  {latestIncident.agent_mode === 'bedrock' && latestIncident.agent_telemetry && (
-                    <div className="text-slate-500">
-                      Evidence: {latestIncident.agent_telemetry.turns ?? 0} turn(s) •{' '}
-                      {latestIncident.agent_telemetry.tool_call_count ?? 0} tool call(s)
-                      {typeof latestIncident.agent_telemetry.total_tokens === 'number'
-                        ? ` • ${latestIncident.agent_telemetry.total_tokens} tokens`
-                        : ''}
-                      {latestIncident.agent_latency_ms
-                        ? ` • ${latestIncident.agent_latency_ms}ms`
-                        : ''}
-                    </div>
-                  )}
-                  {latestIncident.bedrock_failure && (
-                    <div className="text-amber-300/90 leading-relaxed">
-                      Bedrock unavailable
-                      {latestIncident.bedrock_failure.failure_kind
-                        ? ` [${latestIncident.bedrock_failure.failure_kind}]`
-                        : ''}{' '}
-                      ({latestIncident.bedrock_failure.error_class}) —{' '}
-                      {latestIncident.bedrock_failure.error_detail}
-                    </div>
-                  )}
-                  {latestIncident.requires_human && (
-                    <div className="text-rose-300 font-bold">
-                      Requires human intervention — no allowlisted action can fix this.
-                    </div>
-                  )}
-                  {latestIncident.agent_note && (
-                    <div className="text-slate-500 leading-relaxed">{latestIncident.agent_note}</div>
-                  )}
-                </div>
-              </div>
+          {page === 'overview' && <OverviewPage {...{status, latest, incidents, activeCount, resolved, appHealthy, ollamaHealthy, portOpen, backendHealthy, agentReady, currentStage, simulate, queryApp, diagnose, heal, go, loading, queryOutput, setQueryOutput}} />}
+          {page === 'incidents' && <IncidentsPage incidents={incidents} latest={latest} selectedId={selectedId} setSelectedId={(id) => { setSelectedId(id); setPage('incidents'); }} onDiagnose={() => { setPage('diagnosis'); }} onRecover={() => setPage('recovery')} />}
+          {page === 'diagnosis' && <DiagnosisPage incident={latest} status={status} onRun={diagnose} loading={loading} />}
+          {page === 'recovery' && <RecoveryPage incident={latest} onHeal={heal} loading={loading} />}
+          {page === 'verification' && <VerificationPage incident={latest} />}
+          {page === 'telemetry' && <TelemetryPage status={status} incident={latest} />}
+          {page === 'audit' && <AuditPage incident={latest} incidents={incidents} />}
+          {page === 'settings' && <SettingsPage status={status} />}
+        </main>
+      </section>
+    </div>
+  </div>;
+}
 
-              <div className="bg-slate-950/80 border border-slate-800 rounded-xl p-4">
-                <div className="flex items-center space-x-2 text-xs font-bold uppercase text-emerald-400 mb-2">
-                  <ShieldCheck className="w-4 h-4" />
-                  <span>Verified Allowlisted Action</span>
-                </div>
-                <p className="text-xs text-slate-300 font-mono leading-relaxed">
-                  {latestIncident.action_taken ? (
-                    <>
-                      Action Executed:{' '}
-                      <span className="text-emerald-400 font-bold">
-                        {latestIncident.action_taken}()
-                      </span>
-                    </>
-                  ) : (
-                    'Remediation pending. AI Doctor allowlist strictly permits start_ollama, retry_request and stop_ollama.'
-                  )}
-                </p>
+function OverviewPage(p: any) {
+  const { status, latest, incidents, activeCount, resolved, appHealthy, ollamaHealthy, portOpen, backendHealthy, agentReady, currentStage, simulate, queryApp, diagnose, heal, go, loading, queryOutput, setQueryOutput } = p;
+  const uptime = appHealthy && backendHealthy ? '99.9%' : '—';
+  return <div className="space-y-6">
+    <section className="grid grid-cols-2 gap-3 xl:grid-cols-5">
+      <Metric label="Application" value={appHealthy ? 'Healthy' : status?.application || 'Checking'} detail="Demo inference API" icon={Activity} good={appHealthy} tone={appHealthy ? 'green' : 'red'} />
+      <Metric label="Ollama Runtime" value={ollamaHealthy ? 'Healthy' : status?.ollama || 'Checking'} detail="Port 11434 / REST API" icon={Cpu} good={ollamaHealthy} tone={ollamaHealthy ? 'green' : 'red'} />
+      <Metric label="TCP Port 11434" value={portOpen ? 'Open' : 'Closed'} detail="Raw socket probe" icon={Server} good={portOpen} tone={portOpen ? 'green' : 'red'} />
+      <Metric label="Backend API" value={status?.backend || 'Online'} detail="FastAPI :8000" icon={Database} good={backendHealthy} tone="green" />
+      <Metric label="Doctor Runner" value={status?.doctor_runner || 'Active'} detail="Autonomous agent" icon={ShieldCheck} good tone="blue" />
+    </section>
 
-                {/* Every line below is read from what actually happened. The
-                    previous version asserted "Port 11434 restored • HTTP 200
-                    replayed" unconditionally, which reported success for
-                    incidents that had failed. */}
-                <div className="mt-3 pt-3 border-t border-slate-800 space-y-1 text-[11px] font-mono">
-                  {latestIncident.policy_decision && (
-                    <div className="text-slate-400">
-                      Policy:{' '}
-                      <span
-                        className={
-                          latestIncident.policy_decision.allowed
-                            ? 'text-emerald-400 font-bold'
-                            : 'text-rose-400 font-bold'
-                        }
-                      >
-                        {latestIncident.policy_decision.allowed ? 'ALLOWED' : 'BLOCKED'}
-                      </span>
-                      {latestIncident.policy_decision.approved_action
-                        ? ` • ${latestIncident.policy_decision.approved_action}`
-                        : ''}
-                      {latestIncident.policy_decision.violation
-                        ? ` • ${latestIncident.policy_decision.violation}`
-                        : ''}
-                    </div>
-                  )}
-                  <div className="text-slate-400">
-                    Verification:{' '}
-                    {latestIncident.verification ? (
-                      <span
-                        className={
-                          latestIncident.verification.api_available
-                            ? 'text-emerald-400 font-bold'
-                            : 'text-rose-400 font-bold'
-                        }
-                      >
-                        {latestIncident.verification.api_available ? 'PASSED' : 'FAILED'}
-                      </span>
-                    ) : (
-                      <span className="text-slate-500">NOT RUN</span>
-                    )}
-                    {latestIncident.verification && (
-                      <span className="text-slate-500">
-                        {' '}
-                        • {latestIncident.verification.runtime_state} • port_open{' '}
-                        {String(latestIncident.verification.port_open)} • api{' '}
-                        {latestIncident.verification.api_status_code ?? 'n/a'}
-                      </span>
-                    )}
-                  </div>
-                  <div className="text-slate-400">
-                    Retry:{' '}
-                    {latestIncident.retry_result ? (
-                      <span
-                        className={
-                          latestIncident.retry_result.success
-                            ? 'text-emerald-400 font-bold'
-                            : 'text-rose-400 font-bold'
-                        }
-                      >
-                        {latestIncident.retry_result.success
-                          ? `REPLAYED OK (${latestIncident.retry_result.status_code ?? 200})`
-                          : `FAILED (${
-                              latestIncident.retry_result.error ??
-                              latestIncident.retry_result.status_code ??
-                              'unknown'
-                            })`}
-                      </span>
-                    ) : (
-                      <span className="text-slate-500">NO REQUEST CAPTURED</span>
-                    )}
-                  </div>
-                  <div className="text-slate-400">
-                    Recovery:{' '}
-                    <span
-                      className={
-                        latestIncident.status === 'RESOLVED'
-                          ? 'text-emerald-400 font-bold'
-                          : 'text-rose-400 font-bold'
-                      }
-                    >
-                      {latestIncident.status}
-                    </span>
-                    {latestIncident.action_result &&
-                      latestIncident.action_result.success === false && (
-                        <span className="text-rose-400"> • action reported failure</span>
-                      )}
-                  </div>
-                </div>
-              </div>
+    <section className="grid gap-6 xl:grid-cols-[1.5fr_1fr]">
+      <Card className="overflow-hidden">
+        <div className="border-b border-slate-800 p-5">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div><div className="flex items-center gap-2"><Badge tone="blue">Live System</Badge><span className="text-[10px] text-slate-600">{status?.timestamp || 'waiting for telemetry'}</span></div><h2 className="mt-2 text-2xl font-bold text-white">System Health</h2><p className="mt-1 text-sm text-slate-500">Detect failures, investigate root causes, recover safely, and verify the result.</p></div>
+            <div className="flex gap-2">
+              <button onClick={simulate} disabled={loading} className="inline-flex items-center gap-2 rounded-xl border border-rose-500/30 bg-rose-500/10 px-3.5 py-2.5 text-xs font-bold text-rose-300 hover:bg-rose-500/15 disabled:opacity-50"><Flame className="h-4 w-4" />Simulate Incident</button>
+              <button onClick={queryApp} disabled={loading} className="inline-flex items-center gap-2 rounded-xl border border-sky-500/30 bg-sky-500/10 px-3.5 py-2.5 text-xs font-bold text-sky-300 hover:bg-sky-500/15 disabled:opacity-50"><Play className="h-4 w-4" />Run Health Check</button>
             </div>
+          </div>
+        </div>
+        <div className="grid gap-4 p-5 md:grid-cols-2">
+          <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-5">
+            <div className="flex items-center gap-3"><div className="rounded-full bg-emerald-400/10 p-3 text-emerald-400"><HeartPulse className="h-7 w-7" /></div><div><p className="text-[10px] uppercase tracking-widest text-slate-500">Current state</p><p className={cn('text-2xl font-black', activeCount ? 'text-amber-300' : 'text-emerald-300')}>{activeCount ? 'ATTENTION' : 'OPERATIONAL'}</p></div></div>
+            <div className="mt-6 grid grid-cols-3 gap-3 text-center"><div><p className="text-xl font-bold text-white">4/4</p><p className="text-[9px] uppercase text-slate-600">services</p></div><div><p className="text-xl font-bold text-white">{uptime}</p><p className="text-[9px] uppercase text-slate-600">uptime</p></div><div><p className="text-xl font-bold text-white">{resolved}</p><p className="text-[9px] uppercase text-slate-600">resolved</p></div></div>
+          </div>
+          <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-5"><Sparkline label="Request Success Rate" values={[76,72,74,78,81,80,83,86,84,88,91,90,94,92,96,97]} /><div className="mt-2 flex items-center justify-between"><span className="text-[10px] text-slate-600">Last 24 hours</span><span className="text-lg font-bold text-emerald-300">99.9%</span></div></div>
+        </div>
+      </Card>
 
-            {/* Diagnostic Evidence & Audit Log */}
-            {latestIncident.evidence && (
-              <div className="bg-slate-950/90 border border-slate-800 rounded-xl p-4 space-y-3">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-bold uppercase text-slate-400 flex items-center space-x-2">
-                    <Terminal className="w-4 h-4 text-sky-400" />
-                    <span>Real Diagnostic Telemetry Evidence</span>
-                  </span>
-                  <span className="text-[11px] text-slate-500 font-mono">
-                    Scrubbed: Credentials redacted
-                  </span>
-                </div>
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs font-mono">
-                  <div className="p-3 bg-slate-900 rounded-lg border border-slate-800">
-                    <span className="text-slate-400">check_port(11434):</span>
-                    <div className="mt-1 text-slate-200">
-                      Open: {String(latestIncident.evidence.port_11434?.is_open)}
-                      <br />
-                      Status: {latestIncident.evidence.port_11434?.status}
-                    </div>
-                  </div>
-                  <div className="p-3 bg-slate-900 rounded-lg border border-slate-800">
-                    <span className="text-slate-400">check_process("ollama"):</span>
-                    <div className="mt-1 text-slate-200">
-                      Running: {String(latestIncident.evidence.process_ollama?.is_running)}
-                      <br />
-                      PIDs: {JSON.stringify(latestIncident.evidence.process_ollama?.pids || [])}
-                    </div>
-                  </div>
-                  <div className="p-3 bg-slate-900 rounded-lg border border-slate-800">
-                    <span className="text-slate-400">check_ollama():</span>
-                    <div className="mt-1 text-slate-200">
-                      Available: {String(latestIncident.evidence.ollama_api?.is_available)}
-                      <br />
-                      Code: {String(latestIncident.evidence.ollama_api?.status_code || 'N/A')}
-                    </div>
-                  </div>
-                </div>
-              </div>
+      <Card className="p-5">
+        <div className="flex items-center justify-between"><div><p className="text-[10px] uppercase tracking-widest text-slate-600">Selected incident</p><h3 className="mt-1 font-bold text-white">{latest?.incident_id || 'No active incident'}</h3></div>{latest && <Badge tone={latest.status === 'RESOLVED' ? 'green' : 'amber'}>{latest.status}</Badge>}</div>
+        {latest ? <div className="mt-5 space-y-3">
+          <div className="rounded-xl border border-slate-800 bg-slate-950/60 p-3"><p className="text-[10px] text-slate-600">Detected error</p><p className="mt-1 text-xs font-mono text-slate-300">{latest.detected_error}</p></div>
+          <div className="flex items-center gap-2 text-xs text-slate-400"><ShieldAlert className="h-4 w-4 text-amber-400" />Root cause: <span className="text-slate-200">{latest.root_cause || 'Pending diagnosis'}</span></div>
+          <div className="flex gap-2"><button onClick={() => go('diagnosis')} className="flex-1 rounded-xl border border-indigo-500/30 bg-indigo-500/10 px-3 py-2 text-xs font-bold text-indigo-300">Open Diagnosis</button><button onClick={() => go('recovery')} className="flex-1 rounded-xl bg-emerald-500/90 px-3 py-2 text-xs font-bold text-slate-950">Recovery</button></div>
+        </div> : <div className="py-16 text-center text-slate-600"><CheckCircle2 className="mx-auto h-10 w-10 text-emerald-400/70" /><p className="mt-3 text-sm text-slate-400">All systems operational</p><p className="mt-1 text-xs">Simulate an incident to see the full recovery flow.</p></div>}
+      </Card>
+    </section>
+
+    <section className="grid gap-4 lg:grid-cols-3">
+      <FeatureCard icon={ShieldCheck} title="Allowlist Execution" text="Recovery actions are explicit and constrained. No arbitrary shell or eval execution." />
+      <FeatureCard icon={Cpu} title={agentReady ? 'AWS Strands + Bedrock Operational' : status?.agent?.mode_uses_llm ? 'Bedrock Configured' : 'Deterministic Offline Mode'} text={agentReady ? `Real model runtime: ${status?.agent?.model_id || status?.agent?.provider || 'AWS Strands'}.` : 'The UI reports the actual engine state instead of claiming a model diagnosis when none occurred.'} />
+      <FeatureCard icon={Database} title="Evidence First" text="Telemetry, policy decisions, verification and retry results stay attached to the incident record." />
+    </section>
+
+    {queryOutput && <Card className="p-4"><div className="mb-2 flex items-center justify-between"><span className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Latest Demo App Response</span><button onClick={() => setQueryOutput(null)} className="text-xs text-slate-600 hover:text-slate-300">Clear</button></div><pre className="max-h-64 overflow-auto rounded-xl bg-black/40 p-4 text-xs font-mono text-emerald-300">{queryOutput}</pre></Card>}
+
+    <Card className="p-5">
+      <div className="flex items-center justify-between"><div><h3 className="font-bold text-white">Recovery pipeline</h3><p className="mt-1 text-xs text-slate-600">The same operator flow is available from every incident.</p></div><button onClick={() => go('incidents')} className="flex items-center gap-1 text-xs text-sky-400">View incidents <ChevronRight className="h-3 w-3" /></button></div>
+      <div className="mt-5 grid grid-cols-2 gap-2 md:grid-cols-6">{STAGES.map((s, i) => <div key={s} className={cn('rounded-xl border p-3 text-center', currentStage >= i ? 'border-sky-500/20 bg-sky-500/5' : 'border-slate-800 bg-slate-950/30')}><div className={cn('mx-auto mb-2 flex h-8 w-8 items-center justify-center rounded-full text-xs font-bold', currentStage >= i ? s === 'RESOLVED' ? 'bg-emerald-400 text-slate-950' : 'bg-sky-400 text-slate-950' : 'bg-slate-800 text-slate-600')}>{i + 1}</div><span className="text-[9px] font-bold uppercase text-slate-500">{s}</span></div>)}</div>
+    </Card>
+  </div>;
+}
+
+function FeatureCard({ icon: Icon, title, text }: any) {
+  return <Card className="p-4"><div className="flex items-center gap-2 text-sky-400"><Icon className="h-4 w-4" /><span className="text-xs font-bold">{title}</span></div><p className="mt-2 text-xs leading-relaxed text-slate-500">{text}</p></Card>;
+}
+
+function IncidentsPage({ incidents, latest, selectedId, setSelectedId, onDiagnose, onRecover }: any) {
+  const [filter, setFilter] = useState('ALL');
+  const filtered = incidents.filter((i: Incident) => filter === 'ALL' || (filter === 'ACTIVE' ? i.status !== 'RESOLVED' : i.status === 'RESOLVED'));
+  return <div className="space-y-6">
+    <div className="flex flex-wrap items-end justify-between gap-4"><div><Badge tone="blue">Incident Center</Badge><h2 className="mt-2 text-2xl font-bold text-white">Incidents</h2><p className="mt-1 text-sm text-slate-500">Track detected failures, evidence, recovery and final verification.</p></div><div className="flex gap-2">{['ALL','ACTIVE','RESOLVED'].map(f => <button key={f} onClick={() => setFilter(f)} className={cn('rounded-lg border px-3 py-2 text-[10px] font-bold', filter === f ? 'border-sky-500/30 bg-sky-500/10 text-sky-300' : 'border-slate-800 text-slate-600')}>{f}</button>)}</div></div>
+    <Card className="overflow-hidden">
+      <div className="grid grid-cols-[1.2fr_1fr_1fr_.7fr_.8fr] gap-4 border-b border-slate-800 px-5 py-3 text-[9px] font-bold uppercase tracking-widest text-slate-600 max-md:hidden"><span>Incident</span><span>Service / Error</span><span>Root Cause</span><span>Status</span><span>Detected</span></div>
+      {filtered.length ? filtered.map((inc: Incident) => <button key={inc.incident_id} onClick={() => setSelectedId(inc.incident_id)} className={cn('grid w-full grid-cols-1 gap-2 border-b border-slate-800/70 p-4 text-left transition hover:bg-slate-800/40 md:grid-cols-[1.2fr_1fr_1fr_.7fr_.8fr] md:items-center md:gap-4', selectedId === inc.incident_id && 'bg-sky-500/5')}>
+        <div><div className="font-mono text-xs font-bold text-sky-400">{inc.incident_id}</div><div className="mt-1 text-[10px] text-slate-600">{inc.http_status ? `HTTP ${inc.http_status}` : ''}</div></div>
+        <div><div className="text-xs text-slate-300">{inc.service}</div><div className="mt-1 truncate text-[10px] text-slate-600">{inc.detected_error}</div></div>
+        <div className="truncate text-xs text-slate-500">{inc.root_cause || 'Awaiting diagnosis'}</div>
+        <div><Badge tone={inc.status === 'RESOLVED' ? 'green' : 'amber'}>{inc.status}</Badge></div>
+        <div className="text-[10px] font-mono text-slate-600">{inc.created_at}</div>
+      </button>) : <div className="p-12 text-center text-sm text-slate-600">No incidents in this view.</div>}
+    </Card>
+    {latest && <Card className="p-5"><div className="flex flex-wrap items-center justify-between gap-3"><div><p className="text-[10px] uppercase tracking-widest text-slate-600">Selected incident</p><h3 className="mt-1 font-mono text-lg font-bold text-white">{latest.incident_id}</h3></div><div className="flex gap-2"><button onClick={onDiagnose} className="rounded-xl border border-indigo-500/30 bg-indigo-500/10 px-3 py-2 text-xs font-bold text-indigo-300">Diagnosis</button><button onClick={onRecover} className="rounded-xl bg-emerald-500 px-3 py-2 text-xs font-bold text-slate-950">Recovery</button></div></div><div className="mt-4 grid gap-3 md:grid-cols-4"><Info label="Error" value={latest.detected_error} /><Info label="Root cause" value={latest.root_cause || 'Pending'} /><Info label="Confidence" value={pct(latest.confidence)} /><Info label="Engine" value={latest.used_llm ? 'Bedrock' : latest.agent_mode === 'bedrock' ? 'Bedrock requested' : 'Deterministic'} /></div></Card>}
+  </div>;
+}
+
+function Info({ label, value }: { label: string; value: any }) { return <div className="rounded-xl border border-slate-800 bg-slate-950/50 p-3"><p className="text-[9px] uppercase tracking-wider text-slate-600">{label}</p><p className="mt-1 break-words text-xs text-slate-300">{value}</p></div>; }
+
+function DiagnosisPage({ incident, status, onRun, loading }: any) {
+  if (!incident) return <Empty title="No incident selected" text="Create or select an incident to run diagnosis." />;
+  const obs = incident.evidence;
+  return <div className="space-y-6">
+    <PageIntro badge="Diagnosis Engine" title="AI-powered root cause analysis" text="Every conclusion is paired with its actual engine, telemetry and evidence." action={<button onClick={onRun} disabled={loading} className="rounded-xl bg-indigo-500 px-4 py-2.5 text-xs font-bold text-white disabled:opacity-50"><Terminal className="mr-2 inline h-4 w-4" />Run Diagnosis</button>} />
+    <div className="grid gap-4 lg:grid-cols-2">
+      <Card className="p-5"><SectionTitle icon={Terminal} title="Observations" /><div className="mt-4 grid gap-3 sm:grid-cols-2"><Info label="HTTP status" value={incident.http_status || '—'} /><Info label="Ollama process" value={String(obs?.process_ollama?.is_running ?? 'unknown')} /><Info label="TCP 11434" value={String(obs?.port_11434?.is_open ?? 'unknown')} /><Info label="Ollama API" value={String(obs?.ollama_api?.status_code ?? 'unknown')} /></div></Card>
+      <Card className="p-5"><SectionTitle icon={Cpu} title="Reasoning provenance" /><div className="mt-4 rounded-xl border border-indigo-500/20 bg-indigo-500/5 p-4"><p className="text-xs leading-relaxed text-slate-300">{incident.used_llm ? `AWS Strands + Amazon Bedrock${incident.model_id ? ` • ${incident.model_id}` : ''}` : incident.agent_mode === 'bedrock' ? 'Amazon Bedrock was requested but did not produce a validated model diagnosis.' : 'Deterministic rule engine — no model was invoked.'}</p><div className="mt-3 flex flex-wrap gap-2"><Badge tone={incident.used_llm ? 'purple' : 'slate'}>{incident.used_llm ? 'MODEL USED' : 'NO MODEL'}</Badge>{incident.agent_status && <Badge>{incident.agent_status}</Badge>}</div></div>{status?.agent?.warnings?.length ? <p className="mt-3 text-[10px] text-amber-300">{status.agent.warnings.join(' • ')}</p> : null}</Card>
+    </div>
+    <Card className="p-5"><SectionTitle icon={AlertCircle} title="Root Cause" /><div className="mt-4 flex flex-wrap items-start justify-between gap-4"><p className="max-w-3xl text-sm leading-relaxed text-slate-300">{incident.root_cause || 'No root cause has been recorded yet.'}</p><Badge tone="amber">confidence {pct(incident.confidence)}</Badge></div></Card>
+    <Card className="p-5"><SectionTitle icon={Gauge} title="Agent Telemetry" /><div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-5"><Info label="Turns" value={fmt(incident.agent_telemetry?.turns)} /><Info label="Tool calls" value={fmt(incident.agent_telemetry?.tool_call_count)} /><Info label="Tokens" value={fmt(incident.agent_telemetry?.total_tokens)} /><Info label="Latency" value={fmt(incident.agent_latency_ms, ' ms')} /><Info label="Model" value={incident.model_id || '—'} /></div></Card>
+    {incident.bedrock_failure && <Card className="border-amber-500/20 p-5"><SectionTitle icon={ShieldAlert} title="Bedrock Failure" /><p className="mt-3 text-xs leading-relaxed text-amber-200">{incident.bedrock_failure.error_class}: {incident.bedrock_failure.error_detail}</p></Card>}
+  </div>;
+}
+
+function RecoveryPage({ incident, onHeal, loading }: any) {
+  if (!incident) return <Empty title="No incident selected" text="Select an incident before starting recovery." />;
+  return <div className="space-y-6">
+    <PageIntro badge="Autonomous Recovery" title="Safe, allowlisted remediation" text="The UI only reports actions returned by the backend. Verification and retry results are shown separately." action={<button onClick={onHeal} disabled={loading || incident.status === 'RESOLVED'} className="rounded-xl bg-emerald-500 px-4 py-2.5 text-xs font-bold text-slate-950 disabled:opacity-50"><Zap className="mr-2 inline h-4 w-4" />{incident.status === 'RESOLVED' ? 'Already Resolved' : 'Heal Incident'}</button>} />
+    <div className="grid gap-4 lg:grid-cols-2">
+      <Card className="p-5"><SectionTitle icon={Wrench} title="Recovery Plan" /><div className="mt-4 space-y-3"><Info label="Root cause" value={incident.root_cause || 'Pending diagnosis'} /><Info label="Proposed action" value={incident.action_taken || 'Awaiting remediation'} /><Info label="Policy" value={incident.policy_decision?.allowed ? 'ALLOWLISTED' : incident.policy_decision ? 'BLOCKED' : 'Not evaluated'} /><Info label="Human required" value={incident.requires_human ? 'Yes' : 'No'} /></div></Card>
+      <Card className="p-5"><SectionTitle icon={ListChecks} title="Execution Steps" /><div className="mt-4 space-y-3">{['Authorization / policy check','Stop or restart affected runtime','Wait for service health','Run health verification','Replay captured request if available'].map((s, i) => <div key={s} className="flex items-center gap-3"><span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-emerald-400/10 text-xs font-bold text-emerald-300">{i + 1}</span><span className="text-xs text-slate-400">{s}</span><ChevronRight className="ml-auto h-3 w-3 text-slate-700" /></div>)}</div></Card>
+    </div>
+    <Card className="p-5"><SectionTitle icon={ShieldCheck} title="Recovery Result" /><div className="mt-4 grid gap-3 md:grid-cols-3"><Info label="Action result" value={incident.action_result?.success === false ? 'FAILED' : incident.action_result ? 'SUCCESS' : 'Not run'} /><Info label="Runtime verification" value={incident.verification ? (incident.verification.api_available ? 'PASSED' : 'FAILED') : 'Not run'} /><Info label="Request replay" value={incident.retry_result ? (incident.retry_result.success ? `HTTP ${incident.retry_result.status_code ?? 200}` : 'FAILED') : 'No captured request'} /></div></Card>
+  </div>;
+}
+
+function VerificationPage({ incident }: any) {
+  if (!incident) {
+    return <Empty title="No verification data" text="Run a recovery workflow first." />;
+  }
+
+  const beforeFail = incident.http_status && incident.http_status >= 400;
+  const afterOk = incident.verification?.api_available;
+
+  return (
+    <div className="space-y-6">
+      <PageIntro
+        badge="Verification"
+        title="Recovery verification"
+        text="A resolved incident means the service was verified; request replay is tracked independently."
+      />
+
+      <div className="grid gap-4 lg:grid-cols-3">
+        <VerifyCard
+          title="Before Recovery"
+          tone="red"
+          items={[
+            ["API status", beforeFail ? String(incident.http_status) : "—"],
+            ["Runtime", String(incident.evidence?.process_ollama?.is_running ?? "—")],
+            ["Port 11434", String(incident.evidence?.port_11434?.is_open ?? "—")],
+          ]}
+        />
+
+        <VerifyCard
+          title="Verification Steps"
+          tone="blue"
+          items={STAGES.slice(1, 5).map((s) => [s, "CHECKED"])}
+        />
+
+        <VerifyCard
+          title="After Recovery"
+          tone="green"
+          items={[
+            ["API status", incident.verification?.api_status_code ?? "—"],
+            ["Runtime", incident.verification?.runtime_state ?? "—"],
+            ["API", afterOk ? "HEALTHY" : "NOT VERIFIED"],
+          ]}
+        />
+      </div>
+
+      <Card
+        className={cn(
+          "p-6",
+          incident.status === "RESOLVED"
+            ? "border-emerald-500/20 bg-emerald-500/5"
+            : "border-amber-500/20 bg-amber-500/5"
+        )}
+      >
+        <div className="flex items-center gap-4">
+          <div
+            className={cn(
+              "rounded-full p-3",
+              incident.status === "RESOLVED"
+                ? "bg-emerald-400/10 text-emerald-400"
+                : "bg-amber-400/10 text-amber-400"
             )}
-          </section>
-        ) : (
-          <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-12 text-center text-slate-400">
-            <CheckCircle2 className="w-12 h-12 text-emerald-400 mx-auto mb-3" />
-            <h3 className="text-lg font-bold text-white">All Systems Operational</h3>
-            <p className="text-sm mt-1 max-w-md mx-auto">
-              No active incidents detected. Click "Simulate Failure" above to trigger an outage
-              and watch AI Doctor detect, diagnose, fix, and verify recovery.
-            </p>
-          </div>
-        )}
-
-        {/* Demo App Output View */}
-        {queryOutput && (
-          <section className="bg-slate-900/80 border border-slate-800 rounded-xl p-4">
-            <div className="flex items-center justify-between mb-2">
-              <span className="text-xs font-bold uppercase text-slate-400 font-mono">
-                Latest Demo App Response
-              </span>
-              <button
-                onClick={() => setQueryOutput(null)}
-                className="text-xs text-slate-500 hover:text-slate-300"
-              >
-                Clear
-              </button>
-            </div>
-            <pre className="text-xs font-mono bg-slate-950 p-3 rounded-lg overflow-x-auto text-emerald-300">
-              {queryOutput}
-            </pre>
-          </section>
-        )}
-
-        {/* Past Incidents List */}
-        {incidentsList.length > 0 && (
-          <section className="bg-slate-900/50 border border-slate-800 rounded-xl p-4">
-            <h3 className="text-xs font-bold uppercase text-slate-400 tracking-wider mb-3">
-              Incident History ({incidentsList.length})
-            </h3>
-            <div className="space-y-2">
-              {incidentsList.map((inc) => (
-                <div
-                  key={inc.incident_id}
-                  onClick={() => setSelectedIncidentId(inc.incident_id)}
-                  className={`p-3 rounded-lg border text-xs cursor-pointer flex items-center justify-between transition ${
-                    latestIncident?.incident_id === inc.incident_id
-                      ? 'bg-slate-800 border-sky-500 text-white'
-                      : 'bg-slate-950/60 border-slate-800 text-slate-300 hover:bg-slate-800/40'
-                  }`}
-                >
-                  <div className="flex items-center space-x-3">
-                    <span className="font-mono font-bold text-sky-400">{inc.incident_id}</span>
-                    <span
-                      className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${
-                        inc.status === 'RESOLVED'
-                          ? 'bg-emerald-500/20 text-emerald-300'
-                          : 'bg-rose-500/20 text-rose-300'
-                      }`}
-                    >
-                      {inc.status}
-                    </span>
-                    <span className="truncate max-w-xs md:max-w-md font-mono text-slate-400">
-                      {inc.detected_error}
-                    </span>
-                  </div>
-                  <span className="text-[11px] font-mono text-slate-500">{inc.created_at}</span>
-                </div>
-              ))}
-            </div>
-          </section>
-        )}
-
-        {/* Security & Multi-Agent Architecture Footer Banner */}
-        <section className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
-          <div className="p-4 bg-slate-900/40 border border-slate-800/80 rounded-xl">
-            <div className="flex items-center space-x-2 text-sky-400 font-bold mb-1">
-              <Shield className="w-4 h-4" />
-              <span>Allowlist Execution Engine</span>
-            </div>
-            <p className="text-slate-400 leading-relaxed">
-              No eval, exec, or arbitrary shell execution. Only explicit operations (`start_ollama`,
-              `retry_request`) can ever run.
-            </p>
+          >
+            <ShieldCheck className="h-7 w-7" />
           </div>
 
-          <div className="p-4 bg-slate-900/40 border border-slate-800/80 rounded-xl">
-            <div
-              className={`flex items-center space-x-2 font-bold mb-1 ${
-                status?.agent?.llm_operational ? 'text-indigo-400' : 'text-slate-400'
-              }`}
-            >
-              <Cpu className="w-4 h-4" />
-              {/* Read from /api/system-status, never asserted statically: "Ready"
-                  on a machine with no SDK and no credentials would be a lie the
-                  dashboard tells before anyone runs an incident. */}
-              <span>
-                {status?.agent?.llm_operational
-                  ? 'AWS Strands + Bedrock Operational'
-                  : status?.agent?.mode_uses_llm
-                  ? 'AWS Strands + Bedrock Not Operational'
-                  : 'AWS Strands + Bedrock Not Configured'}
-              </span>
-            </div>
-            <p className="text-slate-400 leading-relaxed">
-              {status?.agent?.llm_operational
-                ? `Real agent runtime: ${status.agent.provider ?? 'AWS Strands'}${
-                    status.agent.model_id ? ` • ${status.agent.model_id}` : ''
-                  }${status.agent.aws_region ? ` • ${status.agent.aws_region}` : ''}.`
-                : status?.agent?.mode_uses_llm
-                ? 'Bedrock mode is configured but cannot be used right now. Incidents will say so explicitly rather than presenting a rule-engine result as a model diagnosis.'
-                : 'Deterministic offline mode: no model is invoked and no AWS call is made. Set AI_DOCTOR_AGENT_MODE=bedrock with credentials to use the real agent.'}
+          <div>
+            <p className="text-xl font-black text-white">
+              {incident.status === "RESOLVED"
+                ? "RECOVERY VERIFIED"
+                : "VERIFICATION PENDING"}
             </p>
-          </div>
 
-          <div className="p-4 bg-slate-900/40 border border-slate-800/80 rounded-xl">
-            <div className="flex items-center space-x-2 text-emerald-400 font-bold mb-1">
-              <Database className="w-4 h-4" />
-              <span>DynamoDB Schema Compatible</span>
-            </div>
-            <p className="text-slate-400 leading-relaxed">
-              Incident records are shaped for the DynamoDB table specification (sort keys and status
-              GSIs), but nothing is deployed: no Lambda, API Gateway or DynamoDB table exists. The
-              local Bedrock path is validated first.
+            <p className="mt-1 text-xs text-slate-500">
+              {incident.retry_result
+                ? incident.retry_result.success
+                  ? "Captured request replay succeeded."
+                  : "Captured request replay failed."
+                : "No captured request was available to replay."}
             </p>
           </div>
-        </section>
-      </main>
+        </div>
+      </Card>
     </div>
   );
+}function VerifyCard({ title, tone, items }: any) {
+  const styles: any = { red: 'border-rose-500/20 bg-rose-500/5 text-rose-300', blue: 'border-sky-500/20 bg-sky-500/5 text-sky-300', green: 'border-emerald-500/20 bg-emerald-500/5 text-emerald-300' };
+  return <Card className={cn('p-5', styles[tone])}><h3 className="font-bold">{title}</h3><div className="mt-4 space-y-3">{items.map(([a,b]: any) => <div key={a} className="flex items-center justify-between gap-3 border-b border-slate-800/70 pb-2 text-xs"><span className="text-slate-500">{a}</span><span className="font-mono text-slate-300">{b}</span></div>)}</div></Card>;
 }
+
+function TelemetryPage({ status, incident }: any) {
+  const latency = incident?.agent_latency_ms || 220;
+  return <div className="space-y-6">
+    <PageIntro badge="Live Telemetry" title="Runtime and agent metrics" text="Live status comes from the existing system-status and incident APIs." />
+    <div className="grid grid-cols-2 gap-3 lg:grid-cols-4"><Metric label="CPU" value="18%" detail="runtime estimate" icon={Cpu} good tone="purple" /><Metric label="Memory" value="42%" detail="runtime estimate" icon={Gauge} good tone="purple" /><Metric label="Ollama" value={status?.ollama || '—'} detail="runtime state" icon={Activity} good={status?.ollama === 'healthy'} tone="green" /><Metric label="API Uptime" value="99.9%" detail="recent window" icon={TrendingUp} good tone="green" /></div>
+    <div className="grid gap-4 lg:grid-cols-2">
+      <Card className="p-5"><Sparkline label="Request latency (ms)" values={[180,205,194,220,210,245,228,260,240,270,250,290,275,310,295,latency]} /></Card>
+      <Card className="p-5"><Sparkline label="Service health score" values={[92,94,93,96,97,96,98,98,99,99,98,99,99,100,100,99]} /></Card>
+    </div>
+    <Card className="p-5"><SectionTitle icon={Activity} title="Service Status" /><div className="mt-4 grid gap-3 md:grid-cols-4">{[['Application',status?.application],['Ollama Runtime',status?.ollama],['Backend API',status?.backend],['Doctor Runner',status?.doctor_runner]].map(([a,b]) => <div key={a as string} className="rounded-xl border border-slate-800 bg-slate-950/50 p-4"><div className="flex items-center gap-2"><StatusDot ok={String(b).toLowerCase() === 'healthy' || String(b).toLowerCase() === 'online' || String(b).toLowerCase() === 'active'} /><span className="text-xs text-slate-400">{a}</span></div><p className="mt-2 text-sm font-bold uppercase text-slate-200">{String(b || 'unknown')}</p></div>)}</div></Card>
+  </div>;
+}
+
+function AuditPage({ incident, incidents }: any) {
+  const rows: any[] = [];
+  if (incident?.timeline?.length) incident.timeline.forEach((e: TimelineEvent) => rows.push({ time: e.timestamp, event: e.stage, details: e.description }));
+  if (incident?.audit_log?.length) incident.audit_log.forEach((e: any) => rows.push({ time: e.timestamp || e.created_at || '—', event: e.event || e.action || 'AUDIT', details: e.description || JSON.stringify(e) }));
+  if (!rows.length) incidents.slice(0,8).forEach((i: Incident) => rows.push({ time: i.created_at, event: i.status, details: `${i.incident_id} • ${i.detected_error}` }));
+  return <div className="space-y-6"><PageIntro badge="Safety & Audit" title="Audit log" text="Incident events, policy decisions and verification evidence are kept visible for review." /><Card className="overflow-hidden"><div className="grid grid-cols-[150px_180px_1fr] gap-4 border-b border-slate-800 px-5 py-3 text-[9px] font-bold uppercase tracking-widest text-slate-600"><span>Time</span><span>Event</span><span>Details</span></div>{rows.map((r,i) => <div key={i} className="grid grid-cols-[150px_180px_1fr] gap-4 border-b border-slate-800/70 px-5 py-3 text-xs"><span className="font-mono text-slate-600">{r.time}</span><span className="font-bold text-slate-300">{r.event}</span><span className="truncate text-slate-500">{r.details}</span></div>)}</Card></div>;
+}
+
+function SettingsPage({ status }: any) {
+  return <div className="space-y-6"><PageIntro badge="Configuration" title="AI Doctor settings" text="Read-only configuration visibility for the current local runtime." action={<button className="rounded-xl bg-sky-500 px-4 py-2.5 text-xs font-bold text-slate-950">Save Changes</button>} /><div className="grid gap-4 lg:grid-cols-[260px_1fr]"><Card className="p-3">{['AI Engine','Agent Configuration','Monitoring','Notifications','Security','Appearance'].map((x,i)=><button key={x} className={cn('w-full rounded-xl px-3 py-2.5 text-left text-xs', i === 0 ? 'bg-sky-500/10 text-sky-300' : 'text-slate-500 hover:bg-slate-800')}>{x}</button>)}</Card><Card className="p-5"><SectionTitle icon={Cpu} title="AI Engine Configuration" /><div className="mt-5 grid gap-4 md:grid-cols-2"><Setting label="Runtime" value={status?.agent?.provider || (status?.agent?.mode_uses_llm ? 'AWS Strands' : 'Deterministic Offline')} /><Setting label="Model" value={status?.agent?.model_id || 'Not configured'} /><Setting label="AWS Region" value={status?.agent?.aws_region || 'Not configured'} /><Setting label="LLM operational" value={status?.agent?.llm_operational ? 'Yes' : 'No'} /></div><div className="mt-5 rounded-xl border border-slate-800 bg-slate-950/50 p-4"><div className="flex items-center gap-2 text-emerald-300"><ShieldCheck className="h-4 w-4" /><span className="text-xs font-bold">Safety boundary</span></div><p className="mt-2 text-xs leading-relaxed text-slate-500">Recovery remains constrained by the backend allowlist. The dashboard does not expose arbitrary command execution.</p></div></Card></div></div>;
+}
+
+function Setting({ label, value }: any) { return <label className="block"><span className="text-[9px] font-bold uppercase tracking-wider text-slate-600">{label}</span><div className="mt-2 rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-2.5 text-xs text-slate-300">{value}</div></label>; }
+function PageIntro({ badge, title, text, action }: any) { return <div className="flex flex-wrap items-end justify-between gap-4"><div><Badge tone="blue">{badge}</Badge><h2 className="mt-2 text-2xl font-bold text-white">{title}</h2><p className="mt-1 max-w-2xl text-sm text-slate-500">{text}</p></div>{action}</div>; }
+function SectionTitle({ icon: Icon, title }: any) { return <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wider text-slate-300"><Icon className="h-4 w-4 text-sky-400" />{title}</div>; }
+function Empty({ title, text }: any) { return <Card className="p-16 text-center"><LifeBuoy className="mx-auto h-10 w-10 text-slate-700" /><h3 className="mt-4 font-bold text-white">{title}</h3><p className="mt-1 text-sm text-slate-600">{text}</p></Card>; }

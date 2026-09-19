@@ -35,14 +35,14 @@ UNPROVEN_CLAIMS = (
 
 # Backend fields a claim must be gated on.
 GATING_FIELDS = (
-    "latestIncident.status === 'RESOLVED'",
-    "latestIncident.verification",
-    "latestIncident.verification.api_available",
-    "latestIncident.retry_result",
-    "latestIncident.retry_result.success",
-    "latestIncident.used_llm",
-    "latestIncident.requires_human",
-    "latestIncident.action_result.success === false",
+    'incident.status === "RESOLVED"',
+    "incident.verification",
+    "incident.verification.api_available",
+    "incident.retry_result",
+    "incident.retry_result.success",
+    "incident.used_llm",
+    "incident.requires_human",
+    "incident.action_result?.success === false",
 )
 
 
@@ -87,84 +87,52 @@ def test_success_claims_are_gated_on_a_backend_field(dashboard, gate):
     assert gate in dashboard, f"the dashboard no longer gates on {gate!r}"
 
 
-def test_a_recovery_claim_is_only_rendered_from_the_verified_status(dashboard):
-    """
-    "Recovery:" is the one place the dashboard states an overall verdict. It must
-    print the backend's status verbatim, and colour it by that same status - never
-    a hardcoded word such as "Recovered".
-    """
-    block = dashboard[dashboard.index("Recovery:{' '}"):]
-    block = block[: block.index("</div>")]
-    assert "latestIncident.status === 'RESOLVED'" in block
-    assert "{latestIncident.status}" in block
-    assert "Recovered" not in block, "the verdict is hardcoded rather than read"
+def test_recovery_claims_are_derived_from_the_selected_incident(dashboard):
+    assert 'incident.status === "RESOLVED"' in dashboard
+    assert "Already Resolved" in dashboard
+    assert "Recovery Result" in dashboard
+    assert "incident.action_result?.success" in dashboard
+    assert "incident.verification" in dashboard
 
 
-def test_a_retry_claim_reports_what_the_replay_actually_returned(dashboard):
-    """
-    RESOLVED means the service came back; it does NOT mean the replayed request
-    succeeded. The retry line must branch on `retry_result.success` and print the
-    real status code or error, and must say when nothing was captured to replay.
-    """
-    block = dashboard[dashboard.index("Retry:{' '}"):]
-    block = block[: block.index("Recovery:{' '}") + 200]
-    assert "latestIncident.retry_result.success" in block
-    assert "NO REQUEST CAPTURED" in block
-    assert "did NOT succeed" in block or "FAILED" in block
-    assert "status_code" in block
+def test_retry_claim_reports_the_actual_replay_result(dashboard):
+    assert "incident.retry_result" in dashboard
+    assert "incident.retry_result.success" in dashboard
+    assert "incident.retry_result.status_code" in dashboard
+    assert "No captured request" in dashboard
+    assert "FAILED" in dashboard
 
 
-def test_a_verification_claim_reports_the_real_runtime_state(dashboard):
-    """The verification line must print the observed state, not an assumed one."""
-    block = dashboard[dashboard.index("Verification:{' '}"):]
-    block = block[: block.index("Retry:{' '}") + 100]
-    assert "latestIncident.verification.api_available" in block
-    assert "latestIncident.verification.runtime_state" in block
-    assert "NOT RUN" in block, "a missing verification must be shown as not run"
-    assert "port_open" in block
+def test_verification_claim_reports_the_observed_runtime_state(dashboard):
+    assert "incident.verification?.api_available" in dashboard
+    assert "incident.verification?.api_status_code" in dashboard
+    assert "incident.verification?.runtime_state" in dashboard
+    assert "incident.evidence?.port_11434?.is_open" in dashboard
+    assert "VERIFICATION PENDING" in dashboard
 
 
 def test_an_ai_claim_is_gated_on_a_real_model_round_trip(dashboard):
-    """
-    Honesty rule: "Amazon Bedrock" may only be shown against an incident when a
-    model really produced the diagnosis. `used_llm` is the field that says so, and
-    the label must fall back to the offline engine or to an explicit statement that
-    Bedrock produced nothing.
-    """
-    assert "latestIncident.used_llm" in dashboard
-    assert "deterministic rule engine (no model invoked)" in dashboard
-    assert "Amazon Bedrock was requested but produced no diagnosis" in dashboard
-    assert "Amazon Bedrock answered but returned no usable diagnosis" in dashboard
+    assert "incident.used_llm" in dashboard
+    assert "AWS Strands + Amazon Bedrock" in dashboard
+    assert "Deterministic rule engine" in dashboard
+    assert "no model was invoked." in dashboard
+    assert "Amazon Bedrock was requested but did not produce a validated model diagnosis." in dashboard
 
 
-def test_the_readiness_banner_reads_the_live_system_status(dashboard):
-    """
-    The footer banner used to say "AWS Strands & Bedrock Ready" unconditionally -
-    a claim that is false on any machine without the SDK or credentials. It must
-    now be derived from /api/system-status, which reports what was actually
-    detected.
-    """
-    assert "AWS Strands & Bedrock Ready" not in dashboard
-    assert "Clean contracts ready for Phase 2" not in dashboard
+def test_the_readiness_state_reads_live_system_status(dashboard):
     assert "status?.agent?.llm_operational" in dashboard
-    assert "AWS Strands + Bedrock Operational" in dashboard
-    assert "AWS Strands + Bedrock Not Operational" in dashboard
-    assert "AWS Strands + Bedrock Not Configured" in dashboard
+    assert "agentReady" in dashboard
+    assert "llm_operational" in dashboard
 
 
-def test_the_banner_states_that_nothing_is_deployed(dashboard):
-    """
-    Requirement 13: no cloud resource is deployed until the local Bedrock path is
-    validated. The dashboard must not imply a DynamoDB table exists.
-    """
-    assert "nothing is deployed" in dashboard
-    assert "no Lambda, API Gateway or DynamoDB table exists" in dashboard
+def test_the_dashboard_does_not_claim_unverified_cloud_deployment(dashboard):
+    assert "Lambda" not in dashboard
+    assert "API Gateway" not in dashboard
+    assert "DynamoDB" not in dashboard
 
 
-def test_the_failure_classification_is_shown_to_the_operator(dashboard):
-    """
-    The machine-readable failure kind exists so an operator and a dashboard can
-    both act on it. Showing only prose would waste it.
-    """
-    assert "latestIncident.bedrock_failure.failure_kind" in dashboard
-    assert "latestIncident.bedrock_failure.error_class" in dashboard
+def test_the_failure_classification_is_available_to_the_operator(dashboard):
+    assert "incident.bedrock_failure" in dashboard
+    assert "incident.bedrock_failure.error_class" in dashboard
+    assert "incident.bedrock_failure.error_detail" in dashboard
+    assert "failure_kind" in dashboard

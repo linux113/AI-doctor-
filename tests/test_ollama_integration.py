@@ -62,7 +62,27 @@ from tests.conftest import free_port
 
 
 def _write_double(tmp_path, name: str, body: str) -> str:
-    """Writes an executable shell script used as an injected runtime double."""
+    """Writes a cross-platform executable used as an injected runtime double."""
+    if os.name == "nt":
+        path = tmp_path / f"{name}.py"
+
+        if "sleep 20" in body:
+            code = "import time\ntime.sleep(20)\n"
+        elif "exit 7" in body:
+            code = "import sys\nsys.exit(7)\n"
+        elif "exit 3" in body:
+            code = (
+                "import sys\n"
+                "print('Error: could not bind or load models', file=sys.stderr, flush=True)\n"
+                "sys.exit(3)\n"
+            )
+        else:
+            code = "pass\n"
+
+        path.write_text(code)
+
+        return str(path)
+
     path = tmp_path / name
     path.write_text("#!/bin/sh\n" + body)
     path.chmod(0o755)
@@ -80,7 +100,11 @@ def _runtime_with_injected_executable(port: int, exe: str, **kwargs) -> OllamaRu
     claiming to be Ollama.
     """
     runtime = OllamaRuntime(port=port, poll_interval=0.05, **kwargs)
-    runtime._resolved_executable = exe
+    if os.name == "nt" and exe.lower().endswith(".py"):
+        runtime._resolved_executable = sys.executable
+        runtime._serve_args = [exe] + list(runtime._serve_args)
+    else:
+        runtime._resolved_executable = exe
     runtime._resolution_attempted = True
     return runtime
 
@@ -441,19 +465,23 @@ def test_F_a_dead_daemon_behind_a_stale_socket_is_not_verified(tmp_path):
     from runner.remediation_registry import remediation_registry
 
     port = free_port()
-    original = remediation_registry._actions["start_ollama"]["fn"]
+    runtime = get_runtime()
+    original_port = runtime.port
+    original_action = remediation_registry._actions["start_ollama"]["fn"]
     remediation_registry._actions["start_ollama"]["fn"] = lambda: {
         "action": "start_ollama",
         "success": True,
         "message": "lying action",
     }
     try:
+        runtime.port = port
         out = doctor_runner.run_remediation_and_verify("start_ollama")
         assert out["success"] is False
         assert out["stage"] == "VERIFY"
         assert out["runtime_state"] != OLLAMA_RUNNING
     finally:
-        remediation_registry._actions["start_ollama"]["fn"] = original
+        remediation_registry._actions["start_ollama"]["fn"] = original_action
+        runtime.port = original_port
     assert check_port(port)["is_open"] is False
 
 

@@ -511,7 +511,7 @@ def check_ollama(report: Report) -> Tuple[str, Any]:
         api_healthy=status.api_healthy, api_status_code=status.api_status_code,
     )
     report.add("ollama:state", PASS if status.state == "OLLAMA_RUNNING" else WARN,
-               status.state, state=status.state, detail=status.detail)
+               status.detail or status.state, state=status.state)
     return status.state, status
 
 

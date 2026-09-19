@@ -40,6 +40,7 @@ import os
 import shutil
 import signal
 import subprocess
+import tempfile
 import sys
 import time
 from dataclasses import dataclass, field
@@ -231,8 +232,13 @@ class OllamaRuntime:
         self._resolved_executable: Optional[str] = None
         self._resolution_attempted = False
         self._version: Optional[str] = None
+        default_log_path = (
+            os.path.join(tempfile.gettempdir(), "ai-doctor", "ollama.log")
+            if os.name == "nt"
+            else "/tmp/ai-doctor-ollama.log"
+        )
         self.log_path = log_path or os.environ.get(
-            "OLLAMA_RUNTIME_LOG", "/tmp/ai-doctor-ollama.log"
+            "OLLAMA_RUNTIME_LOG", default_log_path
         )
         self._serve_args = list(serve_args) if serve_args else [SERVE_ARG]
         # PID of the daemon this process started, if any.
@@ -244,9 +250,11 @@ class OllamaRuntime:
     def _candidates(self) -> List[str]:
         """Ordered candidate executable paths: env override, PATH, known prefixes."""
         out: List[str] = []
-        env_exe = self._explicit_executable or os.environ.get("OLLAMA_EXECUTABLE")
+        if self._explicit_executable:
+            return [os.path.expanduser(self._explicit_executable)]
+        env_exe = os.environ.get("OLLAMA_EXECUTABLE")
         if env_exe:
-            out.append(os.path.expanduser(env_exe))
+            return [os.path.expanduser(env_exe)]
         which = shutil.which("ollama")
         if which:
             out.append(which)
@@ -695,6 +703,30 @@ class OllamaRuntime:
             detail=detail,
         )
 
+    def _verified_ollama_parent(self, proc: psutil.Process) -> Optional[psutil.Process]:
+        """Return the verified Ollama desktop parent of a real daemon, if present."""
+        if os.name != "nt":
+            return None
+        try:
+            parent = proc.parent()
+            if parent is None or (parent.name() or "").lower() != "ollama app.exe":
+                return None
+
+            parent_exe = parent.exe()
+            daemon_exe = self.resolve_executable()
+            if not parent_exe or not daemon_exe:
+                return None
+
+            parent_real = os.path.realpath(parent_exe)
+            daemon_real = os.path.realpath(daemon_exe)
+
+            if os.path.dirname(parent_real).lower() != os.path.dirname(daemon_real).lower():
+                return None
+
+            return parent
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, OSError):
+            return None
+
     def stop(self, grace_seconds: float = 8.0) -> StopResult:
         """
         Stops the real Ollama daemon.
@@ -738,6 +770,10 @@ class OllamaRuntime:
             )
 
         targets = self.find_ollama_processes()
+        for daemon in list(targets):
+            parent = self._verified_ollama_parent(daemon)
+            if parent and parent.pid not in {p.pid for p in targets}:
+                targets.append(parent)
         if pid_hint and pid_hint != self_pid and pid_hint not in {p.pid for p in targets}:
             try:
                 targets.append(psutil.Process(pid_hint))
