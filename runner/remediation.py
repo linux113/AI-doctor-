@@ -85,7 +85,7 @@ def retry_request(
     method: str = "GET",
     payload: Optional[Dict[str, Any]] = None,
     headers: Optional[Dict[str, str]] = None,
-    timeout: float = 5.0,
+    timeout: float = 30.0,
 ) -> Dict[str, Any]:
     if not url:
         return {
