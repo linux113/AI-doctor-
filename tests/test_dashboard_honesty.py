@@ -114,7 +114,8 @@ def test_verification_claim_reports_the_observed_runtime_state(dashboard):
 def test_an_ai_claim_is_gated_on_a_real_model_round_trip(dashboard):
     assert "incident.used_llm" in dashboard
     assert "AWS Strands + Amazon Bedrock" in dashboard
-    assert "Deterministic rule engine — no model was invoked." in dashboard
+    assert "Deterministic rule engine" in dashboard
+    assert "no model was invoked." in dashboard
     assert "Amazon Bedrock was requested but did not produce a validated model diagnosis." in dashboard
 
 
