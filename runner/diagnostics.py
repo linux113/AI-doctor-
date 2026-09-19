@@ -126,7 +126,7 @@ def check_ollama(host: str = "127.0.0.1", port: int = 11434, timeout: float = 2.
             raw = resp.read().decode("utf-8")
             data = json.loads(raw)
             available = (status_code == 200)
-            response_body = f"Models available: {len(data.get('models', []))}"
+            response_body = data
     except urllib.error.URLError as e:
         error_message = str(e.reason) if hasattr(e, "reason") else str(e)
     except Exception as e:

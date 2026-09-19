@@ -81,12 +81,19 @@ def stop_ollama() -> Dict[str, Any]:
 
 
 def retry_request(
-    url: str,
+    url: Optional[str] = None,
     method: str = "GET",
     payload: Optional[Dict[str, Any]] = None,
     headers: Optional[Dict[str, str]] = None,
     timeout: float = 5.0,
 ) -> Dict[str, Any]:
+    if not url:
+        return {
+            "action": "retry_request",
+            "success": False,
+            "error": "retry_request requires a captured request URL, but this incident has no request context to replay.",
+        }
+
     """
     Safely retries the original failed application request.
     Validates URL scheme and host to prevent SSRF.

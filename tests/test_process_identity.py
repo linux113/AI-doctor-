@@ -34,8 +34,18 @@ def decoy_shell():
     the shape of a wrapper shell, a script, an editor, a grep or `tail -f`.
     It is not the runtime and must never be treated as such.
     """
+    if os.name == "nt":
+        cmd = [
+            os.environ.get("ComSpec", "cmd.exe"),
+            "/d",
+            "/c",
+            "ping 127.0.0.1 -n 46 >nul",
+        ]
+    else:
+        cmd = ["/bin/bash", "-c", "sleep 45  # decoy mentioning ollama serve"]
+
     proc = subprocess.Popen(
-        ["/bin/bash", "-c", "sleep 45  # decoy mentioning ollama serve"],
+        cmd,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
