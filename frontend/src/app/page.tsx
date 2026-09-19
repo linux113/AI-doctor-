@@ -441,21 +441,89 @@ function RecoveryPage({ incident, onHeal, loading }: any) {
 }
 
 function VerificationPage({ incident }: any) {
-  if (!incident) return <Empty title="No verification data" text="Run a recovery workflow first." />;
+  if (!incident) {
+    return <Empty title="No verification data" text="Run a recovery workflow first." />;
+  }
+
   const beforeFail = incident.http_status && incident.http_status >= 400;
   const afterOk = incident.verification?.api_available;
-  return <div className="space-y-6">
-    <PageIntro badge="Verification" title="Recovery verification" text="A resolved incident means the service was verified; request replay is tracked independently." />
-    <div className="grid gap-4 lg:grid-cols-3">
-      <VerifyCard title="Before Recovery" tone="red" items={[['API status', beforeFail ? String(incident.http_status) : '—'], ['Runtime', String(incident.evidence?.process_ollama?.is_running ?? '—')], ['Port 11434', String(incident.evidence?.port_11434?.is_open ?? '—')]] />
-      <VerifyCard title="Verification Steps" tone="blue" items={STAGES.slice(1,5).map(s => [s, 'CHECKED'])} />
-      <VerifyCard title="After Recovery" tone="green" items={[['API status', incident.verification?.api_status_code ?? '—'], ['Runtime', incident.verification?.runtime_state ?? '—'], ['API', afterOk ? 'HEALTHY' : 'NOT VERIFIED']]} />
-    </div>
-    <Card className={cn('p-6', incident.status === 'RESOLVED' ? 'border-emerald-500/20 bg-emerald-500/5' : 'border-amber-500/20 bg-amber-500/5')}><div className="flex items-center gap-4"><div className={cn('rounded-full p-3', incident.status === 'RESOLVED' ? 'bg-emerald-400/10 text-emerald-400' : 'bg-amber-400/10 text-amber-400')}><ShieldCheck className="h-7 w-7" /></div><div><p className="text-xl font-black text-white">{incident.status === 'RESOLVED' ? 'RECOVERY VERIFIED' : 'VERIFICATION PENDING'}</p><p className="mt-1 text-xs text-slate-500">{incident.retry_result ? incident.retry_result.success ? 'Captured request replay succeeded.' : 'Captured request replay failed.' : 'No captured request was available to replay.'}</p></div></div></Card>
-  </div>;
-}
 
-function VerifyCard({ title, tone, items }: any) {
+  return (
+    <div className="space-y-6">
+      <PageIntro
+        badge="Verification"
+        title="Recovery verification"
+        text="A resolved incident means the service was verified; request replay is tracked independently."
+      />
+
+      <div className="grid gap-4 lg:grid-cols-3">
+        <VerifyCard
+          title="Before Recovery"
+          tone="red"
+          items={[
+            ["API status", beforeFail ? String(incident.http_status) : "—"],
+            ["Runtime", String(incident.evidence?.process_ollama?.is_running ?? "—")],
+            ["Port 11434", String(incident.evidence?.port_11434?.is_open ?? "—")],
+          ]}
+        />
+
+        <VerifyCard
+          title="Verification Steps"
+          tone="blue"
+          items={STAGES.slice(1, 5).map((s) => [s, "CHECKED"])}
+        />
+
+        <VerifyCard
+          title="After Recovery"
+          tone="green"
+          items={[
+            ["API status", incident.verification?.api_status_code ?? "—"],
+            ["Runtime", incident.verification?.runtime_state ?? "—"],
+            ["API", afterOk ? "HEALTHY" : "NOT VERIFIED"],
+          ]}
+        />
+      </div>
+
+      <Card
+        className={cn(
+          "p-6",
+          incident.status === "RESOLVED"
+            ? "border-emerald-500/20 bg-emerald-500/5"
+            : "border-amber-500/20 bg-amber-500/5"
+        )}
+      >
+        <div className="flex items-center gap-4">
+          <div
+            className={cn(
+              "rounded-full p-3",
+              incident.status === "RESOLVED"
+                ? "bg-emerald-400/10 text-emerald-400"
+                : "bg-amber-400/10 text-amber-400"
+            )}
+          >
+            <ShieldCheck className="h-7 w-7" />
+          </div>
+
+          <div>
+            <p className="text-xl font-black text-white">
+              {incident.status === "RESOLVED"
+                ? "RECOVERY VERIFIED"
+                : "VERIFICATION PENDING"}
+            </p>
+
+            <p className="mt-1 text-xs text-slate-500">
+              {incident.retry_result
+                ? incident.retry_result.success
+                  ? "Captured request replay succeeded."
+                  : "Captured request replay failed."
+                : "No captured request was available to replay."}
+            </p>
+          </div>
+        </div>
+      </Card>
+    </div>
+  );
+}function VerifyCard({ title, tone, items }: any) {
   const styles: any = { red: 'border-rose-500/20 bg-rose-500/5 text-rose-300', blue: 'border-sky-500/20 bg-sky-500/5 text-sky-300', green: 'border-emerald-500/20 bg-emerald-500/5 text-emerald-300' };
   return <Card className={cn('p-5', styles[tone])}><h3 className="font-bold">{title}</h3><div className="mt-4 space-y-3">{items.map(([a,b]: any) => <div key={a} className="flex items-center justify-between gap-3 border-b border-slate-800/70 pb-2 text-xs"><span className="text-slate-500">{a}</span><span className="font-mono text-slate-300">{b}</span></div>)}</div></Card>;
 }
