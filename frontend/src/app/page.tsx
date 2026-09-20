@@ -56,6 +56,12 @@ interface SystemStatus {
   active_incidents_count: number;
   timestamp: string;
   agent?: AgentInfo | null;
+  storage?: {
+    mode?: string;
+    table_configured?: boolean;
+    persistent?: boolean;
+    configuration_error?: string | null;
+  };
 }
 
 interface TimelineEvent {
@@ -536,15 +542,102 @@ function VerificationPage({ incident }: any) {
 }
 
 function TelemetryPage({ status, incident }: any) {
-  const latency = incident?.agent_latency_ms || 220;
+  const latency = incident?.agent_latency_ms ?? incident?.agent_telemetry?.agent_latency_ms;
+
   return <div className="space-y-6">
-    <PageIntro badge="Live Telemetry" title="Runtime and agent metrics" text="Live status comes from the existing system-status and incident APIs." />
-    <div className="grid grid-cols-2 gap-3 lg:grid-cols-4"><Metric label="CPU" value="18%" detail="runtime estimate" icon={Cpu} good tone="purple" /><Metric label="Memory" value="42%" detail="runtime estimate" icon={Gauge} good tone="purple" /><Metric label="Ollama" value={status?.ollama || '—'} detail="runtime state" icon={Activity} good={status?.ollama === 'healthy'} tone="green" /><Metric label="API Uptime" value="99.9%" detail="recent window" icon={TrendingUp} good tone="green" /></div>
-    <div className="grid gap-4 lg:grid-cols-2">
-      <Card className="p-5"><Sparkline label="Request latency (ms)" values={[180,205,194,220,210,245,228,260,240,270,250,290,275,310,295,latency]} /></Card>
-      <Card className="p-5"><Sparkline label="Service health score" values={[92,94,93,96,97,96,98,98,99,99,98,99,99,100,100,99]} /></Card>
+    <PageIntro
+      badge="Live Telemetry"
+      title="Runtime and agent metrics"
+      text="Values below are read from the backend. Historical CPU, memory and uptime are not fabricated when the API does not expose them."
+    />
+
+    <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+      <Metric
+        label="Backend"
+        value={status?.backend || '—'}
+        detail="API Gateway / FastAPI"
+        icon={Server}
+        good={status?.backend === 'healthy' || status?.backend === 'online'}
+        tone="green"
+      />
+      <Metric
+        label="Ollama"
+        value={status?.ollama || '—'}
+        detail={status?.runtime_state || 'runtime state'}
+        icon={Activity}
+        good={status?.ollama === 'healthy'}
+        tone="green"
+      />
+      <Metric
+        label="Agent"
+        value={status?.agent?.agent_mode || '—'}
+        detail={status?.agent?.llm_operational ? 'LLM operational' : 'Model call unavailable'}
+        icon={Cpu}
+        good={!!status?.agent?.llm_operational}
+        tone="purple"
+      />
+      <Metric
+        label="Incidents"
+        value={String(status?.active_incidents_count ?? 0)}
+        detail="active incidents"
+        icon={AlertCircle}
+        good={(status?.active_incidents_count ?? 0) === 0}
+        tone={(status?.active_incidents_count ?? 0) === 0 ? 'green' : 'red'}
+      />
     </div>
-    <Card className="p-5"><SectionTitle icon={Activity} title="Service Status" /><div className="mt-4 grid gap-3 md:grid-cols-4">{[['Application',status?.application],['Ollama Runtime',status?.ollama],['Backend API',status?.backend],['Doctor Runner',status?.doctor_runner]].map(([a,b]) => <div key={a as string} className="rounded-xl border border-slate-800 bg-slate-950/50 p-4"><div className="flex items-center gap-2"><StatusDot ok={String(b).toLowerCase() === 'healthy' || String(b).toLowerCase() === 'online' || String(b).toLowerCase() === 'active'} /><span className="text-xs text-slate-400">{a}</span></div><p className="mt-2 text-sm font-bold uppercase text-slate-200">{String(b || 'unknown')}</p></div>)}</div></Card>
+
+    <div className="grid gap-4 lg:grid-cols-2">
+      <Card className="p-5">
+        <SectionTitle icon={Activity} title="Current runtime" />
+        <div className="mt-4 space-y-3">
+          {[
+            ['Application', status?.application],
+            ['Ollama runtime', status?.ollama],
+            ['Runtime state', status?.runtime_state],
+            ['Port 11434', status?.port_11434_open ? 'OPEN' : 'CLOSED'],
+            ['Doctor Runner', status?.doctor_runner],
+            ['Storage', status?.storage?.persistent ? 'DYNAMODB' : 'PROCESS MEMORY'],
+          ].map(([label, value]) => (
+            <div key={label as string} className="flex items-center justify-between border-b border-slate-800/70 pb-2 text-xs">
+              <span className="text-slate-500">{label}</span>
+              <span className="font-mono uppercase text-slate-300">{String(value ?? '—')}</span>
+            </div>
+          ))}
+        </div>
+      </Card>
+
+      <Card className="p-5">
+        <SectionTitle icon={Zap} title="Agent telemetry" />
+        <div className="mt-4 space-y-3">
+          {[
+            ['Mode', incident?.agent_mode || status?.agent?.agent_mode],
+            ['Provider', status?.agent?.provider],
+            ['Model', incident?.model_id || status?.agent?.model_id],
+            ['AWS region', incident?.aws_region || status?.agent?.aws_region],
+            ['Latency', typeof latency === 'number' ? `${latency} ms` : '—'],
+            ['Tool calls', incident?.agent_telemetry?.tool_call_count ?? '—'],
+            ['Tokens', incident?.agent_telemetry?.total_tokens ?? '—'],
+          ].map(([label, value]) => (
+            <div key={label as string} className="flex items-center justify-between border-b border-slate-800/70 pb-2 text-xs">
+              <span className="text-slate-500">{label}</span>
+              <span className="max-w-[60%] truncate font-mono text-right text-slate-300">{String(value ?? '—')}</span>
+            </div>
+          ))}
+        </div>
+      </Card>
+    </div>
+
+    <Card className="p-5">
+      <SectionTitle icon={ShieldCheck} title="Telemetry integrity" />
+      <p className="mt-3 text-xs leading-relaxed text-slate-500">
+        The dashboard does not invent CPU, memory, uptime or historical latency values. Add a metrics endpoint or CloudWatch integration when those measurements are required.
+      </p>
+      {status?.storage?.configuration_error && (
+        <p className="mt-3 rounded-xl border border-amber-500/20 bg-amber-500/5 p-3 text-xs text-amber-300">
+          Storage configuration warning: {status.storage.configuration_error}
+        </p>
+      )}
+    </Card>
   </div>;
 }
 
