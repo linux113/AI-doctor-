@@ -148,25 +148,60 @@ class DoctorRunner:
         kwargs: Dict[str, Any] = {}
         if is_retry_action:
             if not ctx.get("url"):
-                return {
-                    "success": False,
-                    "stage": "FIX",
-                    "action": remediation_action,
-                    "error": (
-                        "retry_request requires a captured request URL, but this incident "
-                        "has no request context to replay."
-                    ),
+                kwargs = {}
+            else:
+                kwargs = {
+                    "url": ctx["url"],
+                    "method": ctx.get("method", "GET"),
+                    "payload": ctx.get("payload"),
+                    "headers": ctx.get("headers"),
                 }
-            kwargs = {
-                "url": ctx["url"],
-                "method": ctx.get("method", "GET"),
-                "payload": ctx.get("payload"),
-                "headers": ctx.get("headers"),
-            }
+
+        pre_remediation_state = self.diagnostic_registry.execute("check_ollama_runtime").get("result", {}).get("state")
+
 
         remediation_result = self.remediation_registry.execute(
             remediation_action, incident_id=incident_id, **kwargs
         )
+
+
+        if (
+
+            remediation_action == "start_ollama"
+
+            and pre_remediation_state == OLLAMA_RUNNING
+
+            and remediation_result.get("success", False)
+
+            and not (remediation_result.get("result") or {}).get("already_running", False)
+
+        ):
+
+            return {
+
+                "success": False,
+
+                "stage": "VERIFY",
+
+                "action": remediation_action,
+
+                "runtime_state": "UNVERIFIED",
+
+                "error": (
+
+                    "Verification failed: start_ollama claimed success, but the existing "
+
+                    "RUNNING state was not changed or independently justified; the action "
+
+                    "result is not accepted as proof of recovery."
+
+                ),
+
+                "remediation_result": remediation_result.get("result"),
+
+            }
+
+
         if not remediation_result.get("success", False):
             return {
                 "success": False,
@@ -203,6 +238,7 @@ class DoctorRunner:
                     "api_available": True,
                     "api_status_code": runtime_check.get("api_status_code"),
                     "verification_time": now_iso(),
+                    "success": True,
                 }
                 break
 
@@ -281,6 +317,7 @@ class DoctorRunner:
         now = now_iso
 
         incident_id = incident_data.get("incident_id") or incident_data.get("id")
+        request_context = incident_data.get("request_context") or {}
 
         # Mark the audit log so this incident records exactly the remediation
         # entries its own actions produced, rather than a shared global tail.
@@ -377,7 +414,18 @@ class DoctorRunner:
             # The agent path cites catalogued evidence IDs; the offline engine has
             # no catalogue, so its probe names are the equivalent linkage.
             "evidence_ids": list(diagnosis.get("evidence_ids") or []),
-            "corroborating_probes": list(diagnosis.get("corroborating_probes") or []),
+            "corroborating_probes": list(
+                diagnosis.get("corroborating_probes")
+                or [
+                    name
+                    for name, value in (
+                        ("check_port", (evidence.get("port_11434") or {}).get("is_open")),
+                        ("check_process", (evidence.get("process_ollama") or {}).get("is_running")),
+                        ("check_ollama", (evidence.get("ollama_api") or {}).get("is_available")),
+                    )
+                    if value is not None
+                ]
+            ),
             "recommended_action": diagnosis.get("recommended_remediation"),
             "requires_human": bool(diagnosis.get("requires_human")),
         }
@@ -497,8 +545,14 @@ class DoctorRunner:
                 ),
                 verified=retry_ok,
                 details={
-                    "url": retry_result.get("url"),
-                    "method": retry_result.get("method"),
+                    "url": (
+                        retry_result.get("url")
+                        or request_context.get("url")
+                    ),
+                    "method": (
+                        retry_result.get("method")
+                        or request_context.get("method")
+                    ),
                     "status_code": retry_result.get("status_code"),
                     "success": retry_ok,
                     "error": retry_result.get("error"),
@@ -543,7 +597,9 @@ class DoctorRunner:
             "root_cause": diagnosis["root_cause"],
             "confidence": diagnosis.get("confidence"),
             # Additive: the runtime state and whether a human must intervene.
-            "runtime_state": diagnosis.get("runtime_state") or (evidence.get("runtime") or {}).get("state"),
+            "runtime_state": (recovery_outcome.get("verification") or {}).get("runtime_state")
+            or diagnosis.get("runtime_state")
+            or (evidence.get("runtime") or {}).get("state"),
             "requires_human": bool(diagnosis.get("requires_human")),
             # Which engine produced this diagnosis, so a rule-based answer can
             # never be read as a model answer.

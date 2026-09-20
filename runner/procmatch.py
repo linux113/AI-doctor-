@@ -86,7 +86,10 @@ def _identity_positions(name: Optional[str], cmdline: Sequence[str]) -> List[Tup
     cleaned = [a for a in (cmdline or ()) if isinstance(a, str) and a]
 
     if name and name.strip():
-        found.append((name.strip().lower(), "process name"))
+        normalized_name = name.strip().lower()
+        found.append((normalized_name, "process name"))
+        if normalized_name.endswith(".exe"):
+            found.append((normalized_name[:-4], "process name without .exe"))
 
     if cleaned:
         argv0 = cleaned[0]

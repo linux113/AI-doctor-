@@ -244,8 +244,6 @@ def credential_source_hint() -> List[str]:
     home = os.path.expanduser("~")
     if os.path.exists(os.path.join(home, ".aws", "credentials")):
         found.append("~/.aws/credentials")
-    if os.path.exists(os.path.join(home, ".aws", "config")):
-        found.append("~/.aws/config")
     return found
 
 

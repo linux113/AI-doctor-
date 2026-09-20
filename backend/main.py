@@ -21,6 +21,7 @@ from .models import (
     TimelineEvent,
     DiagnoseRequest,
     HealRequest,
+    DeveloperErrorRequest,
     DemoQueryRequest,
     SystemStatus,
 )
@@ -356,7 +357,7 @@ def run_heal(payload: HealRequest):
 # =========================================================================
 
 # Upstream call budget for the demo inference request.
-OLLAMA_REQUEST_TIMEOUT = 3.0
+OLLAMA_REQUEST_TIMEOUT = 30.0
 
 
 def _classify_upstream_error(exc: BaseException, url: str, timeout: float) -> tuple:
@@ -374,6 +375,9 @@ def _classify_upstream_error(exc: BaseException, url: str, timeout: float) -> tu
     HTTPError, the status code. Nothing is inferred from message text, and the
     detail is redacted before it is persisted or returned.
     """
+    if isinstance(exc, SensitivePromptError):
+        return "SensitivePromptError", str(exc)
+
     # urllib wraps the underlying cause in URLError.reason. Unwrap it so the
     # class reported is the one that actually occurred, not the wrapper.
     if isinstance(exc, urllib.error.HTTPError):
@@ -406,6 +410,10 @@ def _classify_upstream_error(exc: BaseException, url: str, timeout: float) -> tu
     return exc.__class__.__name__, str(exc) or "No detail available."
 
 
+class SensitivePromptError(Exception):
+    """Raised when credential material is detected in a demo prompt."""
+
+
 @app.post("/api/demo/query")
 def demo_query(payload: DemoQueryRequest):
     """
@@ -414,10 +422,37 @@ def demo_query(payload: DemoQueryRequest):
     If Ollama is stopped -> produces a realistic HTTP 500 failure and records an incident!
     """
     ollama_url = "http://127.0.0.1:11434/api/generate"
-    record_log("INFO", f"Demo application received request: '{payload.prompt[:30]}'", service="demo_app")
+    safe_log_prompt = sanitize_deep(payload.prompt[:30])
+    record_log("INFO", f"Demo application received request: '{safe_log_prompt}'", service="demo_app")
 
     try:
-        req_data = json.dumps({"prompt": payload.prompt, "model": payload.model}).encode("utf-8")
+        safe_prompt = sanitize_deep(payload.prompt)
+        if safe_prompt != payload.prompt:
+            raise SensitivePromptError("Sensitive credential material detected in prompt.")
+
+        # Use the requested model when it is installed. If the demo's default
+        # model is not installed, use an actually installed Ollama model instead.
+        # This does not fake recovery: the real Ollama API must still answer.
+        selected_model = payload.model
+        tags_req = urllib.request.Request(
+            "http://127.0.0.1:11434/api/tags",
+            method="GET",
+        )
+        with urllib.request.urlopen(tags_req, timeout=OLLAMA_REQUEST_TIMEOUT) as tags_resp:
+            tags_data = json.loads(tags_resp.read().decode("utf-8"))
+        installed_models = [
+            item.get("name")
+            for item in (tags_data.get("models") or [])
+            if isinstance(item, dict) and item.get("name")
+        ]
+        if installed_models and selected_model not in installed_models:
+            selected_model = installed_models[0]
+
+        req_data = json.dumps({
+            "prompt": payload.prompt,
+            "model": selected_model,
+            "stream": False,
+        }).encode("utf-8")
         req = urllib.request.Request(
             ollama_url,
             data=req_data,
@@ -430,7 +465,7 @@ def demo_query(payload: DemoQueryRequest):
             return {
                 "status": "success",
                 "app": "demo-inference-service",
-                "model": payload.model,
+                "model": selected_model,
                 "response": data.get("response", "Success"),
             }
     except Exception as e:  # noqa: BLE001 - the real exception is preserved, not flattened
@@ -510,6 +545,56 @@ def demo_query(payload: DemoQueryRequest):
         )
 
 
+
+@app.post("/api/integrations/report-error", response_model=Incident)
+def report_developer_error(payload: DeveloperErrorRequest):
+    """
+    Receives a structured application error from a connected developer app
+    and registers it as an AI Doctor incident.
+    """
+    now_ts = now_iso()
+
+    error_text = sanitize_deep(
+        payload.message or payload.error
+    )
+
+    logs = sanitize_deep(payload.logs) if payload.logs else None
+
+    incident = Incident(
+        status="DETECTED",
+        http_status=500,
+        detected_error=sanitize_deep(payload.error),
+        error_class="DeveloperReportedError",
+        error_detail=error_text,
+        service=sanitize_deep(payload.application),
+        requires_human=False,
+        request_context={
+            "url": sanitize_deep(payload.url) if payload.url else None,
+            "method": sanitize_deep(payload.method) if payload.method else None,
+            "environment": sanitize_deep(payload.environment),
+        },
+        evidence={
+            "source": "developer_integration",
+            "application": sanitize_deep(payload.application),
+            "environment": sanitize_deep(payload.environment),
+            "logs": logs,
+        },
+        timeline=[
+            TimelineEvent(
+                stage="DETECTED",
+                timestamp=now_ts,
+                description=f"Developer application reported an error: {error_text}",
+                details={
+                    "application": sanitize_deep(payload.application),
+                    "environment": sanitize_deep(payload.environment),
+                    "error": sanitize_deep(payload.error),
+                },
+            )
+        ],
+    )
+
+    incident_repo.save(incident)
+    return incident
 @app.post("/api/demo/stop-ollama", dependencies=SENSITIVE_ROUTE_GUARD)
 def trigger_intentional_failure():
     """

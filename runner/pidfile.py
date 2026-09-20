@@ -25,6 +25,8 @@ Two defences, applied together:
 
 import os
 import stat
+import tempfile
+from pathlib import Path
 from typing import Optional, Tuple
 
 import psutil
@@ -32,8 +34,15 @@ import psutil
 from .procmatch import OLLAMA_IDENTITIES, matches_process
 
 # Overridable so deployments can point at a non-world-writable runtime dir
-# (e.g. $XDG_RUNTIME_DIR). Defaults to the historical path for compatibility.
-DEFAULT_PID_FILE = os.environ.get("AIDOCTOR_OLLAMA_PID_FILE", "/tmp/ollama.pid")
+# (e.g. $XDG_RUNTIME_DIR). The default is a user-scoped temporary runtime path.
+def _default_pid_file() -> str:
+    return str(Path(tempfile.gettempdir()) / "ai-doctor" / "ollama.pid")
+
+
+DEFAULT_PID_FILE = os.environ.get(
+    "AIDOCTOR_OLLAMA_PID_FILE",
+    _default_pid_file(),
+)
 
 # Marker identifying the process this project manages. Kept for callers that
 # want the raw string; identity decisions go through procmatch.matches_process,
@@ -54,6 +63,10 @@ def write_pid_file(pid: int, path: str = DEFAULT_PID_FILE) -> bool:
     Returns True on success; failures are non-fatal and reported as False.
     """
     try:
+        parent = os.path.dirname(os.path.abspath(path))
+        if parent:
+            os.makedirs(parent, mode=0o700, exist_ok=True)
+
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
         fd = os.open(path, flags, 0o600)
         try:
