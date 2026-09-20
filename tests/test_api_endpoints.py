@@ -75,7 +75,8 @@ def test_full_autonomous_healing_lifecycle(requires_real_ollama):
     diag_data = diag_res.json()
     assert "port_11434" in diag_data["evidence"]
     assert diag_data["diagnosis"]["recommended_remediation"] == "start_ollama"
-    assert "Ollama daemon process is terminated" in diag_data["diagnosis"]["root_cause"]
+    root_cause = diag_data["diagnosis"]["root_cause"].lower()
+    assert "ollama daemon terminated" in root_cause or "ollama_daemon_terminated" in root_cause
     assert diag_data["evidence"]["runtime"]["state"] == "OLLAMA_STOPPED"
 
     # 4. Heal

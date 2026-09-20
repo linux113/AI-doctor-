@@ -38,6 +38,7 @@ from runner.redaction import sanitize_deep
 from .config import (
     MODE_BEDROCK,
     MODE_DETERMINISTIC,
+    MODE_OPENROUTER,
     AgentConfig,
     AgentConfigurationError,
     credential_source_hint,
@@ -51,10 +52,14 @@ from .strands_agent import (
     STATUS_BEDROCK_SCHEMA_REFUSED,
     STATUS_BEDROCK_SUCCESS,
     STATUS_BEDROCK_UNAVAILABLE,
+    STATUS_OPENROUTER_SUCCESS,
+    STATUS_OPENROUTER_SCHEMA_REFUSED,
+    STATUS_OPENROUTER_UNAVAILABLE,
     STATUS_DIAGNOSED,
     STATUS_FAILED,
     STATUS_REQUIRES_HUMAN,
     BedrockDiagnosisAgent,
+    OpenRouterDiagnosisAgent,
     BedrockUnavailableError,
     classify_bedrock_failure,
 )
@@ -131,8 +136,8 @@ class AgentOutcome:
         came back, so no model diagnosis exists to claim.
         """
         return (
-            self.telemetry.agent_mode == MODE_BEDROCK
-            and self.status == STATUS_BEDROCK_SUCCESS
+            self.telemetry.agent_mode in (MODE_BEDROCK, MODE_OPENROUTER)
+            and self.status in (STATUS_BEDROCK_SUCCESS, STATUS_OPENROUTER_SUCCESS)
             and self.diagnosis_outcome in (STATUS_DIAGNOSED, STATUS_REQUIRES_HUMAN)
         )
 
@@ -177,8 +182,102 @@ def run_diagnosis(
     )
     baseline = diagnose(evidence or {}, initial_error).as_dict()
 
-    if not config.is_bedrock:
+    if not config.is_bedrock and not config.is_openrouter:
         return _deterministic_outcome(baseline, config, started, STATUS_DETERMINISTIC)
+
+    if config.is_openrouter:
+        if not config.openrouter_api_key:
+            failure = {
+                "failure_kind": "OPENROUTER_API_KEY_MISSING",
+                "error_class": "AgentConfigurationError",
+                "aws_error_code": None,
+                "error_detail": (
+                    "OPENROUTER_API_KEY is required when "
+                    "AI_DOCTOR_AGENT_MODE=openrouter."
+                ),
+                "attempted_model_id": config.model_id,
+                "attempted_region": None,
+            }
+            record_log("ERROR", failure["error_detail"], service="agent")
+            return _handle_openrouter_failure(
+                baseline, config, started, failure, incident_id
+            )
+
+        try:
+            agent = OpenRouterDiagnosisAgent(config)
+            result = agent.diagnose(
+                incident_data, evidence, baseline, incident_id
+            )
+        except AgentConfigurationError as exc:
+            failure = {
+                "failure_kind": "OPENROUTER_CONFIGURATION_ERROR",
+                "error_class": type(exc).__name__,
+                "aws_error_code": None,
+                "error_detail": sanitize_deep(str(exc))[:900],
+                "attempted_model_id": config.model_id,
+                "attempted_region": None,
+            }
+            record_log(
+                "ERROR",
+                f"OpenRouter diagnosis unavailable for incident {incident_id}: "
+                f"{failure['error_detail']}",
+                service="agent",
+            )
+            return _handle_openrouter_failure(
+                baseline, config, started, failure, incident_id
+            )
+        except Exception as exc:
+            failure = {
+                "failure_kind": "OPENROUTER_UNAVAILABLE",
+                "error_class": type(exc).__name__,
+                "aws_error_code": None,
+                "error_detail": sanitize_deep(str(exc))[:900],
+                "attempted_model_id": config.model_id,
+                "attempted_region": None,
+            }
+            record_log(
+                "ERROR",
+                f"OpenRouter diagnosis unavailable for incident {incident_id}: "
+                f"{failure['error_detail']}",
+                service="agent",
+            )
+            return _handle_openrouter_failure(
+                baseline, config, started, failure, incident_id
+            )
+
+        report = dict(result.report)
+        report["agent_mode"] = MODE_OPENROUTER
+        report["agent_status"] = result.bedrock_status
+        report["diagnosis_outcome"] = result.status
+        report["bedrock_invoked"] = False
+        report["used_llm"] = result.used_llm
+
+        if result.bedrock_status == STATUS_OPENROUTER_SUCCESS:
+            report["agent_note"] = (
+                f"Diagnosis produced by OpenRouter model {config.model_id} "
+                f"through the OpenAI-compatible Strands Agents SDK "
+                f"({result.telemetry.turns} turn(s), "
+                f"{result.telemetry.tool_call_count} tool call(s))."
+            )
+        else:
+            report["agent_note"] = (
+                f"OpenRouter model {config.model_id} was reached but did not "
+                "return a schema-valid DiagnosisResult. No model diagnosis "
+                "is claimed and no action was approved."
+            )
+
+        return AgentOutcome(
+            report=_with_contract(report),
+            telemetry=result.telemetry,
+            status=result.bedrock_status,
+            diagnosis_outcome=result.status,
+            bedrock_invoked=False,
+            policy_event=(
+                result.policy.audit_event(incident_id)
+                if result.policy
+                else None
+            ),
+        )
 
     if not strands_sdk_available():
         failure = {
@@ -193,15 +292,14 @@ def run_diagnosis(
             "attempted_region": config.aws_region,
         }
         record_log("ERROR", failure["error_detail"], service="agent")
-        return _handle_bedrock_failure(baseline, config, started, failure, incident_id)
+        return _handle_bedrock_failure(
+            baseline, config, started, failure, incident_id
+        )
 
     try:
         agent = BedrockDiagnosisAgent(config)
         result = agent.diagnose(incident_data, evidence, baseline, incident_id)
     except (BedrockUnavailableError, AgentConfigurationError) as exc:
-        # Machine-readable first: `failure_kind` is a stable identifier a
-        # dashboard or alarm can branch on, `error_class` and `aws_error_code`
-        # preserve the underlying AWS identity for CloudTrail lookups.
         kind = getattr(exc, "failure_kind", None) or classify_bedrock_failure(exc)
         failure = {
             "failure_kind": kind,
@@ -214,10 +312,13 @@ def run_diagnosis(
         record_log(
             "ERROR",
             f"Bedrock diagnosis unavailable for incident {incident_id} "
-            f"[{failure['failure_kind']}]: {failure['error_class']}: {failure['error_detail']}",
+            f"[{failure['failure_kind']}]: {failure['error_class']}: "
+            f"{failure['error_detail']}",
             service="agent",
         )
-        return _handle_bedrock_failure(baseline, config, started, failure, incident_id)
+        return _handle_bedrock_failure(
+            baseline, config, started, failure, incident_id
+        )
 
     # A real model round trip. agent_mode is bedrock because Bedrock answered;
     # agent_status records the round trip, diagnosis_outcome records the decision.
@@ -253,6 +354,93 @@ def run_diagnosis(
 # ----------------------------------------------------------------------
 # Outcome builders
 # ----------------------------------------------------------------------
+
+def _handle_openrouter_failure(
+    baseline: Dict[str, Any],
+    config: AgentConfig,
+    started: float,
+    failure: Dict[str, Any],
+    incident_id: Optional[str],
+) -> AgentOutcome:
+    """
+    OpenRouter could not be used. Either fail the incident or run the offline
+    deterministic engine with the substitution stated plainly on the record.
+    """
+    if not config.allow_fallback:
+        telemetry = _deterministic_telemetry(
+            config, started, baseline, error=failure, mode=MODE_OPENROUTER
+        )
+        report = dict(baseline)
+        report.update(
+            {
+                "root_cause": f"Agent diagnosis failed: {failure['error_class']}",
+                "recommended_remediation": "none",
+                "confidence": 0.0,
+                "requires_human": True,
+                "agent_mode": MODE_OPENROUTER,
+                "agent_status": STATUS_OPENROUTER_UNAVAILABLE,
+                "diagnosis_outcome": STATUS_FAILED,
+                "bedrock_invoked": False,
+                "used_llm": False,
+                "notes": None,
+                "agent_note": (
+                    f"OpenRouter could not perform the diagnosis "
+                    f"[{failure['failure_kind']}:{failure['error_class']}] and "
+                    "AI_DOCTOR_AGENT_FALLBACK=fail forbids substituting the offline "
+                    "engine. No remediation was attempted."
+                ),
+                "openrouter_failure": failure,
+            }
+        )
+        record_log(
+            "WARN",
+            f"Incident {incident_id}: OpenRouter unavailable and fallback disabled; "
+            "escalating to a human without acting.",
+            service="agent",
+        )
+        return AgentOutcome(
+            report=_with_contract(report),
+            telemetry=telemetry,
+            status=STATUS_OPENROUTER_UNAVAILABLE,
+            diagnosis_outcome=STATUS_FAILED,
+            bedrock_invoked=False,
+            bedrock_failure=failure,
+        )
+
+    telemetry = _deterministic_telemetry(config, started, baseline, error=failure)
+    report = dict(baseline)
+    report.update(
+        {
+            "agent_mode": MODE_DETERMINISTIC,
+            "agent_status": STATUS_FALLBACK_DETERMINISTIC,
+            "diagnosis_outcome": STATUS_DIAGNOSED,
+            "bedrock_invoked": False,
+            "used_llm": False,
+            "agent_note": (
+                f"OpenRouter was requested but could not be used "
+                f"[{failure['failure_kind']}:{failure['error_class']}]. This diagnosis came "
+                "from the offline deterministic rule engine in runner/diagnosis.py, not from "
+                "a model."
+            ),
+            "openrouter_failure": failure,
+        }
+    )
+    record_log(
+        "WARN",
+        f"Incident {incident_id}: falling back to the deterministic engine "
+        f"after OpenRouter failure ({failure['error_class']}); the incident is "
+        f"labelled {STATUS_FALLBACK_DETERMINISTIC} and no model diagnosis is claimed.",
+        service="agent",
+    )
+    return AgentOutcome(
+        report=_with_contract(report),
+        telemetry=telemetry,
+        status=STATUS_FALLBACK_DETERMINISTIC,
+        diagnosis_outcome=STATUS_DIAGNOSED,
+        bedrock_invoked=False,
+        bedrock_failure=failure,
+    )
+
 
 def _handle_bedrock_failure(
     baseline: Dict[str, Any],

@@ -24,6 +24,7 @@ import pytest
 from agent.config import (
     MODE_BEDROCK,
     MODE_DETERMINISTIC,
+    MODE_OPENROUTER,
     AgentConfig,
     AgentConfigurationError,
     load_agent_config,
@@ -649,7 +650,7 @@ def test_report_contract_is_complete_in_every_mode(no_credentials):
         outcome = run_diagnosis(INCIDENT, DETERMINISTIC_EVIDENCE, "inc-contract", config=config)
         for key in REPORT_CONTRACT_KEYS:
             assert key in outcome.report, f"{config.mode}/{config.fallback} omitted {key}"
-        assert outcome.report["agent_mode"] in (MODE_BEDROCK, MODE_DETERMINISTIC)
+        assert outcome.report["agent_mode"] in (MODE_BEDROCK, MODE_DETERMINISTIC, MODE_OPENROUTER)
 
 
 def test_telemetry_is_persistable_on_an_incident(no_credentials):
@@ -723,7 +724,7 @@ def test_system_status_endpoint_exposes_the_agent_block():
     payload = TestClient(app).get("/api/system-status").json()
     assert "agent" in payload
     agent = payload["agent"]
-    assert agent["agent_mode"] in (MODE_BEDROCK, MODE_DETERMINISTIC)
+    assert agent["agent_mode"] in (MODE_BEDROCK, MODE_DETERMINISTIC, MODE_OPENROUTER)
     assert "llm_operational" in agent and "mode_uses_llm" in agent
     assert "warnings" in agent
     # Configuration state only - never a credential value.

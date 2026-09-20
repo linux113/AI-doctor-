@@ -27,7 +27,8 @@ from typing import Any, Dict, List, Optional
 
 MODE_DETERMINISTIC = "deterministic"
 MODE_BEDROCK = "bedrock"
-VALID_MODES = (MODE_DETERMINISTIC, MODE_BEDROCK)
+MODE_OPENROUTER = "openrouter"
+VALID_MODES = (MODE_DETERMINISTIC, MODE_BEDROCK, MODE_OPENROUTER)
 
 FALLBACK_DETERMINISTIC = "deterministic"
 FALLBACK_FAIL = "fail"
@@ -79,6 +80,8 @@ class AgentConfig:
     mode: str = MODE_DETERMINISTIC
     aws_region: Optional[str] = None
     model_id: Optional[str] = None
+    openrouter_api_key: Optional[str] = None
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
     # Low temperature on purpose: this is troubleshooting, not creative writing.
     temperature: float = 0.0
     max_output_tokens: int = 1024
@@ -109,6 +112,10 @@ class AgentConfig:
     @property
     def is_bedrock(self) -> bool:
         return self.mode == MODE_BEDROCK
+
+    @property
+    def is_openrouter(self) -> bool:
+        return self.mode == MODE_OPENROUTER
 
     @property
     def allow_fallback(self) -> bool:
@@ -170,12 +177,18 @@ def load_agent_config(env: Optional[Dict[str, str]] = None) -> AgentConfig:
         )
 
     region = (source.get("AI_DOCTOR_AWS_REGION") or "").strip() or None
-    model_id = (source.get("AI_DOCTOR_BEDROCK_MODEL_ID") or "").strip() or None
+    if mode == MODE_OPENROUTER:
+        model_id = (source.get("AI_DOCTOR_OPENROUTER_MODEL") or "").strip() or "openrouter/free"
+    else:
+        model_id = (source.get("AI_DOCTOR_BEDROCK_MODEL_ID") or "").strip() or None
+
+    openrouter_api_key = (source.get("OPENROUTER_API_KEY") or "").strip() or None
 
     config = AgentConfig(
         mode=mode,
         aws_region=region or (DEFAULT_REGION if mode == MODE_BEDROCK else None),
-        model_id=model_id or (DEFAULT_MODEL_ID if mode == MODE_BEDROCK else None),
+        model_id=model_id or ("openrouter/free" if mode == MODE_OPENROUTER else (DEFAULT_MODEL_ID if mode == MODE_BEDROCK else None)),
+        openrouter_api_key=openrouter_api_key,
         temperature=_env_float(source, "AI_DOCTOR_AGENT_TEMPERATURE", 0.0, 0.0, 1.0),
         max_output_tokens=_env_int(source, "AI_DOCTOR_AGENT_MAX_OUTPUT_TOKENS", 1024, 64),
         max_turns=_env_int(source, "AI_DOCTOR_AGENT_MAX_TURNS", 6, 1),

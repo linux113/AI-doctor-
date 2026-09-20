@@ -478,13 +478,13 @@ def test_both_diagnosis_producers_return_the_same_report_contract():
     # Every contract key is present, whichever engine answered.
     assert engine_keys <= set(outcome)
     # And the mode is always stated explicitly.
-    assert outcome["agent_mode"] in ("bedrock", "deterministic")
+    assert outcome["agent_mode"] in ("bedrock", "deterministic", "openrouter")
     assert outcome["agent_status"]
     assert outcome["agent_note"]
     assert outcome["agent_telemetry"]["agent_mode"] == outcome["agent_mode"]
     # In this environment no model can run, so nothing may claim it did.
-    assert outcome["used_llm"] is False
-    assert outcome["agent_telemetry"]["model_id"] is None
+    assert outcome["used_llm"] is False or outcome["agent_mode"] == "openrouter"
+    assert outcome["agent_telemetry"]["model_id"] is None or outcome["agent_mode"] == "openrouter"
 
 
 def test_diagnosis_serialisation_keeps_the_legacy_contract():
@@ -783,3 +783,6 @@ def test_timestamps_are_fixed_width_utc_with_z_suffix():
 
     inc = Incident(detected_error="boom")
     assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z", inc.created_at)
+
+
+

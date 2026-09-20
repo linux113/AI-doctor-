@@ -29,8 +29,11 @@ from pydantic import ValidationError
 from runner.diagnostics import record_log
 from runner.redaction import sanitize_deep
 
+from strands.models.openai import OpenAIModel
+
 from .config import (
     MODE_BEDROCK,
+    MODE_OPENROUTER,
     AgentConfig,
     AgentConfigurationError,
     strands_sdk_version,
@@ -56,6 +59,9 @@ _MAX_CAUSE_DEPTH = 8
 STATUS_BEDROCK_SUCCESS = "BEDROCK_SUCCESS"
 STATUS_BEDROCK_SCHEMA_REFUSED = "BEDROCK_SCHEMA_REFUSED"
 STATUS_BEDROCK_UNAVAILABLE = "BEDROCK_UNAVAILABLE"
+STATUS_OPENROUTER_SUCCESS = "OPENROUTER_SUCCESS"
+STATUS_OPENROUTER_SCHEMA_REFUSED = "OPENROUTER_SCHEMA_REFUSED"
+STATUS_OPENROUTER_UNAVAILABLE = "OPENROUTER_UNAVAILABLE"
 
 # Diagnosis outcome - what the pipeline decided.
 STATUS_DIAGNOSED = "DIAGNOSED"
@@ -321,7 +327,7 @@ class AgentDiagnosis:
         A schema refusal does not count: Bedrock answered, but nothing usable came
         back, so there is no model diagnosis to claim.
         """
-        return self.bedrock_status == STATUS_BEDROCK_SUCCESS and self.structured is not None
+        return self.bedrock_status in (STATUS_BEDROCK_SUCCESS, STATUS_OPENROUTER_SUCCESS) and self.structured is not None
 
     def as_dict(self) -> Dict[str, Any]:
         out = dict(self.report)
@@ -912,6 +918,340 @@ class BedrockDiagnosisAgent:
             "uses_llm": True,
         }
 
+
+
+class OpenRouterDiagnosisAgent:
+    """
+    Strands diagnosis agent using an OpenAI-compatible OpenRouter endpoint.
+
+    The diagnostic evidence, tools, structured output and policy gate are the
+    same as the Bedrock path. Only the model provider changes.
+    """
+
+    def __init__(self, config: AgentConfig):
+        if not config.is_openrouter:
+            raise AgentConfigurationError(
+                "OpenRouterDiagnosisAgent requires AI_DOCTOR_AGENT_MODE=openrouter"
+            )
+
+        if not config.openrouter_api_key:
+            raise AgentConfigurationError(
+                "OPENROUTER_API_KEY is required when AI_DOCTOR_AGENT_MODE=openrouter"
+            )
+
+        self.config = config
+        self._last_request_id = None
+
+    def build_model(self) -> OpenAIModel:
+        return OpenAIModel(
+            client_args={
+                "api_key": self.config.openrouter_api_key,
+                "base_url": self.config.openrouter_base_url,
+                "timeout": self.config.request_timeout_seconds,
+            },
+            model_id=self.config.model_id,
+            params={
+                "temperature": self.config.temperature,
+                "max_tokens": self.config.max_output_tokens,
+            },
+        )
+
+    def build_agent(self, budget: ToolBudget):
+        from strands import Agent
+        return Agent(
+            model=self.build_model(),
+            tools=build_diagnostic_tools(budget),
+            system_prompt=SYSTEM_PROMPT,
+        )
+
+    def diagnose(
+        self,
+        incident_data: Dict[str, Any],
+        evidence: Dict[str, Any],
+        deterministic_baseline: Optional[Dict[str, Any]] = None,
+        incident_id: Optional[str] = None,
+    ) -> AgentDiagnosis:
+        incident_id = incident_id or (incident_data or {}).get("incident_id")
+        started = time.monotonic()
+
+        catalog = build_evidence_catalog(
+            evidence or {},
+            max_evidence_bytes=self.config.max_evidence_bytes,
+            max_log_lines=self.config.max_log_lines,
+        )
+        summary = build_incident_summary(incident_data or {})
+        prompt = build_user_prompt(
+            incident_summary=summary,
+            evidence_catalog=catalog.as_list(),
+            deterministic_baseline=deterministic_baseline or {},
+            max_prompt_chars=self.config.max_prompt_chars,
+        )
+
+        budget = ToolBudget(self.config.max_tool_calls)
+
+        try:
+            agent = self.build_agent(budget)
+            record_log(
+                "INFO",
+                f"Invoking OpenRouter ({self.config.model_id}); "
+                f"incident {incident_id}; prompt={len(prompt)} chars, "
+                f"evidence={len(catalog.items)} items.",
+                service="agent",
+            )
+            result = agent(
+                prompt,
+                structured_output_model=DiagnosisResult,
+                limits={
+                    "turns": self.config.max_turns,
+                    "total_tokens": self.config.max_total_tokens,
+                },
+            )
+        except AgentConfigurationError:
+            raise
+        except _schema_refusal_errors() as exc:
+            latency = int((time.monotonic() - started) * 1000)
+            reason = (
+                "OpenRouter did not return a schema-valid DiagnosisResult "
+                f"({type(exc).__name__}). Refusing to act on unstructured output."
+            )
+            telemetry = self._telemetry(
+                latency, budget, None, "structured_output_failed",
+                type(exc).__name__, self._describe(exc), None,
+            )
+            policy = validate_diagnosis(
+                None,
+                evidence_ids=catalog.ids,
+                incident_id=incident_id,
+                budget_exhausted=budget.exhausted,
+                iteration_limit_hit=True,
+            )
+            return AgentDiagnosis(
+                status=STATUS_REQUIRES_HUMAN,
+                report=self._report_from_policy(
+                    policy, catalog, deterministic_baseline, reason
+                ),
+                telemetry=telemetry,
+                policy=policy,
+                structured=None,
+                incident_id=incident_id,
+                bedrock_status=STATUS_OPENROUTER_SCHEMA_REFUSED,
+            )
+        except Exception as exc:
+            detail = self._describe(exc)
+            record_log(
+                "ERROR",
+                f"OpenRouter diagnosis failed for incident {incident_id}: "
+                f"{type(exc).__name__}: {detail}",
+                service="agent",
+            )
+            raise RuntimeError(
+                f"OpenRouter diagnosis failed: {detail}"
+            ) from exc
+
+        latency = int((time.monotonic() - started) * 1000)
+        stop_reason = getattr(result, "stop_reason", None)
+        metrics = getattr(result, "metrics", None)
+        structured = getattr(result, "structured_output", None)
+        iteration_limit_hit = stop_reason in (
+            "limit_turns",
+            "limit_total_tokens",
+            "limit_output_tokens",
+        )
+
+        confidence = (
+            float(structured.confidence)
+            if structured is not None
+            else None
+        )
+
+        telemetry = self._telemetry(
+            latency, budget, metrics, stop_reason,
+            None, None, confidence,
+        )
+
+        if structured is None:
+            reason = (
+                "OpenRouter returned no schema-valid DiagnosisResult "
+                f"(stop_reason={stop_reason}). Refusing to act on unstructured output."
+            )
+            policy = validate_diagnosis(
+                None,
+                evidence_ids=catalog.ids,
+                incident_id=incident_id,
+                budget_exhausted=budget.exhausted,
+                iteration_limit_hit=iteration_limit_hit,
+            )
+            return AgentDiagnosis(
+                status=STATUS_REQUIRES_HUMAN,
+                report=self._report_from_policy(
+                    policy, catalog, deterministic_baseline, reason
+                ),
+                telemetry=telemetry,
+                policy=policy,
+                structured=None,
+                incident_id=incident_id,
+                bedrock_status=STATUS_OPENROUTER_SCHEMA_REFUSED,
+            )
+
+        policy = validate_diagnosis(
+            structured,
+            evidence_ids=catalog.ids,
+            incident_id=incident_id,
+            budget_exhausted=budget.exhausted,
+            iteration_limit_hit=iteration_limit_hit,
+        )
+
+        status = STATUS_DIAGNOSED if policy.allowed else STATUS_REQUIRES_HUMAN
+
+        report = self._report_from_structured(
+            structured, policy, catalog, deterministic_baseline
+        )
+
+        return AgentDiagnosis(
+            status=status,
+            report=report,
+            telemetry=telemetry,
+            policy=policy,
+            structured=structured,
+            incident_id=incident_id,
+            bedrock_status=STATUS_OPENROUTER_SUCCESS,
+        )
+
+    def _telemetry(
+        self,
+        latency_ms: int,
+        budget: ToolBudget,
+        metrics: Any,
+        stop_reason: Optional[str],
+        error_class: Optional[str],
+        error_detail: Optional[str],
+        confidence: Optional[float],
+    ) -> AgentTelemetry:
+        usage_summary = (
+            summarise_tool_use(metrics, budget)
+            if metrics is not None
+            else {
+                "tool_calls": dict(budget.counts),
+                "tool_call_count": budget.total,
+            }
+        )
+
+        usage: Dict[str, Any] = {}
+        turns = 0
+        try:
+            usage = dict(getattr(metrics, "accumulated_usage", {}) or {})
+            turns = int(getattr(metrics, "cycle_count", 0) or 0)
+        except Exception:
+            usage = {}
+
+        return AgentTelemetry(
+            agent_mode=MODE_OPENROUTER,
+            model_id=self.config.model_id,
+            aws_region=None,
+            agent_latency_ms=latency_ms,
+            diagnosis_confidence=confidence,
+            tool_calls=usage_summary.get("tool_calls") or {},
+            tool_call_count=int(usage_summary.get("tool_call_count") or 0),
+            turns=turns,
+            input_tokens=_token_count_or_none(usage.get("inputTokens")),
+            output_tokens=_token_count_or_none(usage.get("outputTokens")),
+            total_tokens=_token_count_or_none(usage.get("totalTokens")),
+            bedrock_request_id=None,
+            stop_reason=str(stop_reason) if stop_reason else None,
+            strands_sdk_version=strands_sdk_version(),
+            error_class=error_class,
+            error_detail=error_detail,
+        )
+
+    def _report_from_structured(
+        self,
+        structured: DiagnosisResult,
+        policy: PolicyDecision,
+        catalog: EvidenceCatalog,
+        baseline: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        sources = {item["id"]: item["source"] for item in catalog.items}
+        corroborating = [
+            sources.get(eid, eid) for eid in structured.evidence_ids
+        ]
+        contradicting = [
+            sources.get(eid, eid)
+            for eid in structured.contradictory_evidence_ids
+        ]
+
+        return {
+            "root_cause": sanitize_deep(
+                f"{structured.hypothesis}: {structured.explanation}"
+            )[:1500],
+            "recommended_remediation": policy.approved_action or "none",
+            "confidence": round(float(structured.confidence), 2),
+            "hypothesis": sanitize_deep(structured.hypothesis)[:200],
+            "corroborating_probes": corroborating,
+            "contradicting_probes": contradicting,
+            "evidence_consistent": not contradicting,
+            "evidence_ids": list(structured.evidence_ids),
+            "contradictory_evidence_ids": list(
+                structured.contradictory_evidence_ids
+            ),
+            "investigation_needed": [
+                sanitize_deep(x)[:200]
+                for x in structured.investigation_needed
+            ],
+            "explanation": sanitize_deep(structured.explanation)[:2000],
+            "requires_human": bool(policy.requires_human),
+            "notes": policy.reason,
+            "runtime_state": (baseline or {}).get("runtime_state"),
+            "agent_mode": MODE_OPENROUTER,
+            "policy_allowed": policy.allowed,
+            "policy_violation": policy.violation,
+        }
+
+    def _report_from_policy(
+        self,
+        policy: PolicyDecision,
+        catalog: EvidenceCatalog,
+        baseline: Optional[Dict[str, Any]],
+        reason: str,
+    ) -> Dict[str, Any]:
+        base = baseline or {}
+        return {
+            "root_cause": sanitize_deep(
+                f"Agent diagnosis unavailable: {reason}"
+            )[:1500],
+            "recommended_remediation": "none",
+            "confidence": 0.0,
+            "hypothesis": "agent_diagnosis_unavailable",
+            "corroborating_probes": [],
+            "contradicting_probes": [],
+            "evidence_consistent": False,
+            "evidence_ids": [],
+            "contradictory_evidence_ids": [],
+            "investigation_needed": [],
+            "explanation": sanitize_deep(reason)[:2000],
+            "requires_human": True,
+            "notes": policy.reason,
+            "runtime_state": base.get("runtime_state"),
+            "agent_mode": MODE_OPENROUTER,
+            "policy_allowed": False,
+            "policy_violation": policy.violation,
+        }
+
+    def _describe(self, exc: BaseException) -> str:
+        return sanitize_deep(
+            f"{type(exc).__name__}: {exc}"
+        )[:600]
+
+    def describe(self) -> Dict[str, Any]:
+        return {
+            "agent_mode": MODE_OPENROUTER,
+            "provider": "OpenRouter via OpenAI-compatible Strands Agents SDK",
+            "model_id": self.config.model_id,
+            "aws_region": None,
+            "strands_sdk_version": strands_sdk_version(),
+            "temperature": self.config.temperature,
+            "tools_exposed": list(ALLOWED_TOOL_NAMES),
+            "uses_llm": True,
+        }
 
 def _int_or_none(value: Any) -> Optional[int]:
     try:

@@ -126,6 +126,19 @@ class DoctorRunner:
                 "(requires_human or refused recommendation).",
                 service="doctor_runner",
             )
+
+            self.remediation_registry._audit_log.append({
+                "action": "none",
+                "incident_id": incident_id,
+                "timestamp": now_iso(),
+                "allowed": False,
+                "status": "PENDING",
+                "result": None,
+                "error": (
+                    "No remediation attempted: the diagnosis approved no action."
+                ),
+            })
+
             return {
                 "success": False,
                 "stage": "FIX",
