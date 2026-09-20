@@ -109,7 +109,8 @@ class IncidentRepository:
         return updated
 
     def get_latest(self) -> Optional[Incident]:
-        return self.list_all(limit=1)[0] if self.list_all(limit=1) else None
+        items = self.list_all(limit=1)
+        return items[0] if items else None
 
     def clear(self):
         if self._table is not None:
