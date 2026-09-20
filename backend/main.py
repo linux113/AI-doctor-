@@ -184,6 +184,12 @@ def get_system_status():
             "cors_allow_credentials": CORS_ALLOW_CREDENTIALS,
             "remediation_allowlist": sorted(REMEDIATION_ALLOWLIST),
         },
+        storage={
+            "mode": "dynamodb" if incident_repo.persistent else "memory",
+            "table_configured": bool(os.environ.get("AIDOCTOR_DYNAMODB_TABLE", "").strip()),
+            "persistent": incident_repo.persistent,
+            "configuration_error": incident_repo.persistence_error,
+        },
         # Which diagnosis engine is actually running. `llm_operational` is false
         # unless bedrock mode is configured, the SDK is installed and a
         # credential source exists, so the dashboard cannot claim an AI

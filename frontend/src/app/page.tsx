@@ -2,6 +2,7 @@
 
 import React, { useEffect, useMemo, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
+import { api } from '../lib/api';
 import {
   Activity, AlertCircle, CheckCircle2, ChevronRight, Clock3, Cpu, Database,
   FileClock, Flame, Gauge, HeartPulse, Home, LifeBuoy, ListChecks, Play,
@@ -55,6 +56,12 @@ interface SystemStatus {
   active_incidents_count: number;
   timestamp: string;
   agent?: AgentInfo | null;
+  storage?: {
+    mode?: string;
+    table_configured?: boolean;
+    persistent?: boolean;
+    configuration_error?: string | null;
+  };
 }
 
 interface TimelineEvent {
@@ -195,9 +202,12 @@ export default function AIDoctorDashboard() {
 
   const refresh = async () => {
     try {
-      const [s, i] = await Promise.all([fetch('/api/system-status'), fetch('/api/incidents?limit=20')]);
-      if (s.ok) setStatus(await s.json());
-      if (i.ok) setIncidents(await i.json());
+      const [s, i] = await Promise.all([
+        api.get<SystemStatus>('/api/system-status', { timeoutMs: 10000 }),
+        api.get<Incident[]>('/api/incidents?limit=20', { timeoutMs: 10000 }),
+      ]);
+      setStatus(s);
+      setIncidents(i);
     } catch (e) {
       console.error(e);
     }
@@ -213,9 +223,7 @@ export default function AIDoctorDashboard() {
     setLoading(true);
     setMessage(label);
     try {
-      const res = await fetch(url, body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : { method: 'POST' });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.detail || data.error || `HTTP ${res.status}`);
+      const data = await api.post(url, body, { timeoutMs: 45000 });
       setMessage('Action completed successfully.');
       await refresh();
       return data;
@@ -228,15 +236,20 @@ export default function AIDoctorDashboard() {
 
   const simulate = () => action('Simulating incident and triggering the demo failure path…', '/api/demo/simulate-incident');
   const queryApp = async () => {
-    setLoading(true); setMessage('Testing demo application query…');
+    setLoading(true);
+    setMessage('Testing demo application query…');
     try {
-      const res = await fetch('/api/demo/query', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ prompt: 'Analyze service health metrics' }) });
-      const data = await res.json();
+      const data = await api.post('/api/demo/query', { prompt: 'Analyze service health metrics' }, { timeoutMs: 45000 });
       setQueryOutput(JSON.stringify(data, null, 2));
-      setMessage(res.ok ? 'Application query returned HTTP 200.' : `Application query failed with HTTP ${res.status}; incident recorded.`);
+      setMessage('Application query returned HTTP 200.');
       await refresh();
-    } catch (e: any) { setMessage(`Request failed: ${e.message}`); }
-    finally { setLoading(false); }
+    } catch (e: any) {
+      setQueryOutput(JSON.stringify(e?.payload || { error: e?.message || 'Request failed' }, null, 2));
+      setMessage(`Application query failed: ${e?.message || 'Unknown error'}; incident may have been recorded.`);
+      await refresh();
+    } finally {
+      setLoading(false);
+    }
   };
   const diagnose = () => latest && action('Running safe diagnostic tools on the selected incident…', '/api/diagnose', { incident_id: latest.incident_id });
   const heal = () => latest && action('Executing allowlisted recovery actions and verification…', '/api/heal', { incident_id: latest.incident_id });
@@ -529,15 +542,102 @@ function VerificationPage({ incident }: any) {
 }
 
 function TelemetryPage({ status, incident }: any) {
-  const latency = incident?.agent_latency_ms || 220;
+  const latency = incident?.agent_latency_ms ?? incident?.agent_telemetry?.agent_latency_ms;
+
   return <div className="space-y-6">
-    <PageIntro badge="Live Telemetry" title="Runtime and agent metrics" text="Live status comes from the existing system-status and incident APIs." />
-    <div className="grid grid-cols-2 gap-3 lg:grid-cols-4"><Metric label="CPU" value="18%" detail="runtime estimate" icon={Cpu} good tone="purple" /><Metric label="Memory" value="42%" detail="runtime estimate" icon={Gauge} good tone="purple" /><Metric label="Ollama" value={status?.ollama || '—'} detail="runtime state" icon={Activity} good={status?.ollama === 'healthy'} tone="green" /><Metric label="API Uptime" value="99.9%" detail="recent window" icon={TrendingUp} good tone="green" /></div>
-    <div className="grid gap-4 lg:grid-cols-2">
-      <Card className="p-5"><Sparkline label="Request latency (ms)" values={[180,205,194,220,210,245,228,260,240,270,250,290,275,310,295,latency]} /></Card>
-      <Card className="p-5"><Sparkline label="Service health score" values={[92,94,93,96,97,96,98,98,99,99,98,99,99,100,100,99]} /></Card>
+    <PageIntro
+      badge="Live Telemetry"
+      title="Runtime and agent metrics"
+      text="Values below are read from the backend. Historical CPU, memory and uptime are not fabricated when the API does not expose them."
+    />
+
+    <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+      <Metric
+        label="Backend"
+        value={status?.backend || '—'}
+        detail="API Gateway / FastAPI"
+        icon={Server}
+        good={status?.backend === 'healthy' || status?.backend === 'online'}
+        tone="green"
+      />
+      <Metric
+        label="Ollama"
+        value={status?.ollama || '—'}
+        detail={status?.runtime_state || 'runtime state'}
+        icon={Activity}
+        good={status?.ollama === 'healthy'}
+        tone="green"
+      />
+      <Metric
+        label="Agent"
+        value={status?.agent?.agent_mode || '—'}
+        detail={status?.agent?.llm_operational ? 'LLM operational' : 'Model call unavailable'}
+        icon={Cpu}
+        good={!!status?.agent?.llm_operational}
+        tone="purple"
+      />
+      <Metric
+        label="Incidents"
+        value={String(status?.active_incidents_count ?? 0)}
+        detail="active incidents"
+        icon={AlertCircle}
+        good={(status?.active_incidents_count ?? 0) === 0}
+        tone={(status?.active_incidents_count ?? 0) === 0 ? 'green' : 'red'}
+      />
     </div>
-    <Card className="p-5"><SectionTitle icon={Activity} title="Service Status" /><div className="mt-4 grid gap-3 md:grid-cols-4">{[['Application',status?.application],['Ollama Runtime',status?.ollama],['Backend API',status?.backend],['Doctor Runner',status?.doctor_runner]].map(([a,b]) => <div key={a as string} className="rounded-xl border border-slate-800 bg-slate-950/50 p-4"><div className="flex items-center gap-2"><StatusDot ok={String(b).toLowerCase() === 'healthy' || String(b).toLowerCase() === 'online' || String(b).toLowerCase() === 'active'} /><span className="text-xs text-slate-400">{a}</span></div><p className="mt-2 text-sm font-bold uppercase text-slate-200">{String(b || 'unknown')}</p></div>)}</div></Card>
+
+    <div className="grid gap-4 lg:grid-cols-2">
+      <Card className="p-5">
+        <SectionTitle icon={Activity} title="Current runtime" />
+        <div className="mt-4 space-y-3">
+          {[
+            ['Application', status?.application],
+            ['Ollama runtime', status?.ollama],
+            ['Runtime state', status?.runtime_state],
+            ['Port 11434', status?.port_11434_open ? 'OPEN' : 'CLOSED'],
+            ['Doctor Runner', status?.doctor_runner],
+            ['Storage', status?.storage?.persistent ? 'DYNAMODB' : 'PROCESS MEMORY'],
+          ].map(([label, value]) => (
+            <div key={label as string} className="flex items-center justify-between border-b border-slate-800/70 pb-2 text-xs">
+              <span className="text-slate-500">{label}</span>
+              <span className="font-mono uppercase text-slate-300">{String(value ?? '—')}</span>
+            </div>
+          ))}
+        </div>
+      </Card>
+
+      <Card className="p-5">
+        <SectionTitle icon={Zap} title="Agent telemetry" />
+        <div className="mt-4 space-y-3">
+          {[
+            ['Mode', incident?.agent_mode || status?.agent?.agent_mode],
+            ['Provider', status?.agent?.provider],
+            ['Model', incident?.model_id || status?.agent?.model_id],
+            ['AWS region', incident?.aws_region || status?.agent?.aws_region],
+            ['Latency', typeof latency === 'number' ? `${latency} ms` : '—'],
+            ['Tool calls', incident?.agent_telemetry?.tool_call_count ?? '—'],
+            ['Tokens', incident?.agent_telemetry?.total_tokens ?? '—'],
+          ].map(([label, value]) => (
+            <div key={label as string} className="flex items-center justify-between border-b border-slate-800/70 pb-2 text-xs">
+              <span className="text-slate-500">{label}</span>
+              <span className="max-w-[60%] truncate font-mono text-right text-slate-300">{String(value ?? '—')}</span>
+            </div>
+          ))}
+        </div>
+      </Card>
+    </div>
+
+    <Card className="p-5">
+      <SectionTitle icon={ShieldCheck} title="Telemetry integrity" />
+      <p className="mt-3 text-xs leading-relaxed text-slate-500">
+        The dashboard does not invent CPU, memory, uptime or historical latency values. Add a metrics endpoint or CloudWatch integration when those measurements are required.
+      </p>
+      {status?.storage?.configuration_error && (
+        <p className="mt-3 rounded-xl border border-amber-500/20 bg-amber-500/5 p-3 text-xs text-amber-300">
+          Storage configuration warning: {status.storage.configuration_error}
+        </p>
+      )}
+    </Card>
   </div>;
 }
 
@@ -550,7 +650,7 @@ function AuditPage({ incident, incidents }: any) {
 }
 
 function SettingsPage({ status }: any) {
-  return <div className="space-y-6"><PageIntro badge="Configuration" title="AI Doctor settings" text="Read-only configuration visibility for the current local runtime." action={<button className="rounded-xl bg-sky-500 px-4 py-2.5 text-xs font-bold text-slate-950">Save Changes</button>} /><div className="grid gap-4 lg:grid-cols-[260px_1fr]"><Card className="p-3">{['AI Engine','Agent Configuration','Monitoring','Notifications','Security','Appearance'].map((x,i)=><button key={x} className={cn('w-full rounded-xl px-3 py-2.5 text-left text-xs', i === 0 ? 'bg-sky-500/10 text-sky-300' : 'text-slate-500 hover:bg-slate-800')}>{x}</button>)}</Card><Card className="p-5"><SectionTitle icon={Cpu} title="AI Engine Configuration" /><div className="mt-5 grid gap-4 md:grid-cols-2"><Setting label="Runtime" value={status?.agent?.provider || (status?.agent?.mode_uses_llm ? 'AWS Strands' : 'Deterministic Offline')} /><Setting label="Model" value={status?.agent?.model_id || 'Not configured'} /><Setting label="AWS Region" value={status?.agent?.aws_region || 'Not configured'} /><Setting label="LLM operational" value={status?.agent?.llm_operational ? 'Yes' : 'No'} /></div><div className="mt-5 rounded-xl border border-slate-800 bg-slate-950/50 p-4"><div className="flex items-center gap-2 text-emerald-300"><ShieldCheck className="h-4 w-4" /><span className="text-xs font-bold">Safety boundary</span></div><p className="mt-2 text-xs leading-relaxed text-slate-500">Recovery remains constrained by the backend allowlist. The dashboard does not expose arbitrary command execution.</p></div></Card></div></div>;
+  return <div className="space-y-6"><PageIntro badge="Configuration" title="AI Doctor settings" text="Read-only configuration visibility for the connected backend. Secrets are intentionally never rendered in the browser." /><div className="grid gap-4 lg:grid-cols-[260px_1fr]"><Card className="p-3">{['AI Engine','Agent Configuration','Monitoring','Notifications','Security','Appearance'].map((x,i)=><button key={x} className={cn('w-full rounded-xl px-3 py-2.5 text-left text-xs', i === 0 ? 'bg-sky-500/10 text-sky-300' : 'text-slate-500 hover:bg-slate-800')}>{x}</button>)}</Card><Card className="p-5"><SectionTitle icon={Cpu} title="AI Engine Configuration" /><div className="mt-5 grid gap-4 md:grid-cols-2"><Setting label="Runtime" value={status?.agent?.provider || (status?.agent?.mode_uses_llm ? 'AWS Strands' : 'Deterministic Offline')} /><Setting label="Model" value={status?.agent?.model_id || 'Not configured'} /><Setting label="AWS Region" value={status?.agent?.aws_region || 'Not configured'} /><Setting label="LLM operational" value={status?.agent?.llm_operational ? 'Yes' : 'No'} /></div><div className="mt-5 rounded-xl border border-slate-800 bg-slate-950/50 p-4"><div className="flex items-center gap-2 text-emerald-300"><ShieldCheck className="h-4 w-4" /><span className="text-xs font-bold">Safety boundary</span></div><p className="mt-2 text-xs leading-relaxed text-slate-500">Recovery remains constrained by the backend allowlist. The dashboard does not expose arbitrary command execution.</p></div></Card></div></div>;
 }
 
 function Setting({ label, value }: any) { return <label className="block"><span className="text-[9px] font-bold uppercase tracking-wider text-slate-600">{label}</span><div className="mt-2 rounded-xl border border-slate-800 bg-slate-950/60 px-3 py-2.5 text-xs text-slate-300">{value}</div></label>; }
