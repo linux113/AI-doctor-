@@ -1,0 +1,8 @@
+# Lambda deployment dependencies.
+-r requirements-core.txt
+
+# ASGI -> AWS Lambda adapter.
+mangum>=0.19,<1
+
+# Optional Bedrock/Strands agent support.
+-r requirements-aws.txt
