@@ -230,19 +230,20 @@ export default function AIDoctorDashboard() {
 
   const simulate = () => action('Simulating incident and triggering the demo failure path…', '/api/demo/simulate-incident');
   const queryApp = async () => {
-    setLoading(true); setMessage('Testing demo application query…');
+    setLoading(true);
+    setMessage('Testing demo application query…');
     try {
-      try {
       const data = await api.post('/api/demo/query', { prompt: 'Analyze service health metrics' }, { timeoutMs: 45000 });
       setQueryOutput(JSON.stringify(data, null, 2));
       setMessage('Application query returned HTTP 200.');
+      await refresh();
     } catch (e: any) {
       setQueryOutput(JSON.stringify(e?.payload || { error: e?.message || 'Request failed' }, null, 2));
       setMessage(`Application query failed: ${e?.message || 'Unknown error'}; incident may have been recorded.`);
-    }
       await refresh();
-    } catch (e: any) { setMessage(`Request failed: ${e.message}`); }
-    finally { setLoading(false); }
+    } finally {
+      setLoading(false);
+    }
   };
   const diagnose = () => latest && action('Running safe diagnostic tools on the selected incident…', '/api/diagnose', { incident_id: latest.incident_id });
   const heal = () => latest && action('Executing allowlisted recovery actions and verification…', '/api/heal', { incident_id: latest.incident_id });
