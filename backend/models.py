@@ -230,6 +230,9 @@ class SystemStatus(BaseModel):
     # CORS origins, and the remediation allowlist. Reports configuration state
     # only - never a secret value.
     security: Optional[Dict[str, Any]] = None
+    # Persistence is explicit so a serverless deployment never looks like it
+    # has durable incident history when it is actually using process memory.
+    storage: Optional[Dict[str, Any]] = None
     # Which diagnosis engine is configured, whether a model call could actually
     # succeed, and any warning that explains a mismatch between the two. Reports
     # configuration state only - never a credential or its contents.
