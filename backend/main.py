@@ -21,6 +21,7 @@ from .models import (
     TimelineEvent,
     DiagnoseRequest,
     HealRequest,
+    DeveloperErrorRequest,
     DemoQueryRequest,
     SystemStatus,
 )
@@ -544,6 +545,56 @@ def demo_query(payload: DemoQueryRequest):
         )
 
 
+
+@app.post("/api/integrations/report-error", response_model=Incident)
+def report_developer_error(payload: DeveloperErrorRequest):
+    """
+    Receives a structured application error from a connected developer app
+    and registers it as an AI Doctor incident.
+    """
+    now_ts = now_iso()
+
+    error_text = sanitize_deep(
+        payload.message or payload.error
+    )
+
+    logs = sanitize_deep(payload.logs) if payload.logs else None
+
+    incident = Incident(
+        status="DETECTED",
+        http_status=500,
+        detected_error=sanitize_deep(payload.error),
+        error_class="DeveloperReportedError",
+        error_detail=error_text,
+        service=sanitize_deep(payload.application),
+        requires_human=False,
+        request_context={
+            "url": sanitize_deep(payload.url) if payload.url else None,
+            "method": sanitize_deep(payload.method) if payload.method else None,
+            "environment": sanitize_deep(payload.environment),
+        },
+        evidence={
+            "source": "developer_integration",
+            "application": sanitize_deep(payload.application),
+            "environment": sanitize_deep(payload.environment),
+            "logs": logs,
+        },
+        timeline=[
+            TimelineEvent(
+                stage="DETECTED",
+                timestamp=now_ts,
+                description=f"Developer application reported an error: {error_text}",
+                details={
+                    "application": sanitize_deep(payload.application),
+                    "environment": sanitize_deep(payload.environment),
+                    "error": sanitize_deep(payload.error),
+                },
+            )
+        ],
+    )
+
+    incident_repo.save(incident)
+    return incident
 @app.post("/api/demo/stop-ollama", dependencies=SENSITIVE_ROUTE_GUARD)
 def trigger_intentional_failure():
     """

@@ -195,6 +195,15 @@ class DiagnoseRequest(BaseModel):
 class HealRequest(BaseModel):
     incident_id: str
 
+class DeveloperErrorRequest(BaseModel):
+    application: str
+    environment: str = "development"
+    error: str
+    url: Optional[str] = None
+    method: Optional[str] = None
+    message: Optional[str] = None
+    logs: Optional[str] = None
+
 
 class DemoQueryRequest(BaseModel):
     # Infrastructure-domain demo prompt. This product is an autonomous

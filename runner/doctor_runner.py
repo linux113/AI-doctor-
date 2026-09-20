@@ -317,6 +317,7 @@ class DoctorRunner:
         now = now_iso
 
         incident_id = incident_data.get("incident_id") or incident_data.get("id")
+        request_context = incident_data.get("request_context") or {}
 
         # Mark the audit log so this incident records exactly the remediation
         # entries its own actions produced, rather than a shared global tail.
@@ -544,8 +545,14 @@ class DoctorRunner:
                 ),
                 verified=retry_ok,
                 details={
-                    "url": retry_result.get("url"),
-                    "method": retry_result.get("method"),
+                    "url": (
+                        retry_result.get("url")
+                        or request_context.get("url")
+                    ),
+                    "method": (
+                        retry_result.get("method")
+                        or request_context.get("method")
+                    ),
                     "status_code": retry_result.get("status_code"),
                     "success": retry_ok,
                     "error": retry_result.get("error"),
