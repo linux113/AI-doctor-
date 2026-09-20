@@ -2,6 +2,7 @@
 
 import React, { useEffect, useMemo, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
+import { api } from '../lib/api';
 import {
   Activity, AlertCircle, CheckCircle2, ChevronRight, Clock3, Cpu, Database,
   FileClock, Flame, Gauge, HeartPulse, Home, LifeBuoy, ListChecks, Play,
@@ -195,9 +196,12 @@ export default function AIDoctorDashboard() {
 
   const refresh = async () => {
     try {
-      const [s, i] = await Promise.all([fetch('/api/system-status'), fetch('/api/incidents?limit=20')]);
-      if (s.ok) setStatus(await s.json());
-      if (i.ok) setIncidents(await i.json());
+      const [s, i] = await Promise.all([
+        api.get<SystemStatus>('/api/system-status', { timeoutMs: 10000 }),
+        api.get<Incident[]>('/api/incidents?limit=20', { timeoutMs: 10000 }),
+      ]);
+      setStatus(s);
+      setIncidents(i);
     } catch (e) {
       console.error(e);
     }
@@ -213,9 +217,7 @@ export default function AIDoctorDashboard() {
     setLoading(true);
     setMessage(label);
     try {
-      const res = await fetch(url, body ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) } : { method: 'POST' });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.detail || data.error || `HTTP ${res.status}`);
+      const data = await api.post(url, body, { timeoutMs: 45000 });
       setMessage('Action completed successfully.');
       await refresh();
       return data;
@@ -230,10 +232,14 @@ export default function AIDoctorDashboard() {
   const queryApp = async () => {
     setLoading(true); setMessage('Testing demo application query…');
     try {
-      const res = await fetch('/api/demo/query', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ prompt: 'Analyze service health metrics' }) });
-      const data = await res.json();
+      try {
+      const data = await api.post('/api/demo/query', { prompt: 'Analyze service health metrics' }, { timeoutMs: 45000 });
       setQueryOutput(JSON.stringify(data, null, 2));
-      setMessage(res.ok ? 'Application query returned HTTP 200.' : `Application query failed with HTTP ${res.status}; incident recorded.`);
+      setMessage('Application query returned HTTP 200.');
+    } catch (e: any) {
+      setQueryOutput(JSON.stringify(e?.payload || { error: e?.message || 'Request failed' }, null, 2));
+      setMessage(`Application query failed: ${e?.message || 'Unknown error'}; incident may have been recorded.`);
+    }
       await refresh();
     } catch (e: any) { setMessage(`Request failed: ${e.message}`); }
     finally { setLoading(false); }
